@@ -9,19 +9,34 @@ import (
 	"EscritorioRemoto-Cliente/pkg/api"
 	"EscritorioRemoto-Cliente/pkg/session"
 	"EscritorioRemoto-Cliente/pkg/utils"
+
+	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 // App struct
 type App struct {
-	ctx             context.Context
-	apiClient       *api.APIClient
-	sessionManager  *session.SessionManager
-	heartbeatTicker *time.Ticker
+	ctx                  context.Context
+	apiClient            *api.APIClient
+	sessionManager       *session.SessionManager
+	heartbeatTicker      *time.Ticker
+	lastConnectionStatus bool
+}
+
+// ConnectionStatus representa el estado de conexión
+type ConnectionStatus struct {
+	IsConnected    bool   `json:"isConnected"`
+	Status         string `json:"status"`
+	LastHeartbeat  int64  `json:"lastHeartbeat"`
+	ServerURL      string `json:"serverUrl"`
+	ConnectionTime int64  `json:"connectionTime"`
+	ErrorMessage   string `json:"errorMessage,omitempty"`
 }
 
 // NewApp creates a new App application struct
 func NewApp() *App {
-	return &App{}
+	return &App{
+		lastConnectionStatus: false,
+	}
 }
 
 // startup is called when the app starts. The context is saved
@@ -39,6 +54,9 @@ func (a *App) startup(ctx context.Context) {
 	if a.sessionManager.IsAuthenticated() {
 		go a.tryReconnect()
 	}
+
+	// Iniciar monitoreo de conexión
+	go a.startConnectionMonitoring()
 }
 
 // shutdown is called when the app is closing
@@ -54,6 +72,47 @@ func (a *App) shutdown(ctx context.Context) {
 	}
 
 	log.Println("App shutdown completed")
+}
+
+// GetConnectionStatus obtiene el estado actual de la conexión
+func (a *App) GetConnectionStatus() ConnectionStatus {
+	isConnected := a.apiClient.IsConnected()
+
+	status := "disconnected"
+	if isConnected {
+		status = "connected"
+	}
+
+	return ConnectionStatus{
+		IsConnected:    isConnected,
+		Status:         status,
+		LastHeartbeat:  time.Now().Unix(),
+		ServerURL:      a.apiClient.GetServerURL(),
+		ConnectionTime: time.Now().Unix(),
+		ErrorMessage:   "",
+	}
+}
+
+// startConnectionMonitoring monitorea el estado de conexión y emite eventos
+func (a *App) startConnectionMonitoring() {
+	ticker := time.NewTicker(5 * time.Second) // Verificar cada 5 segundos (menos agresivo)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		currentStatus := a.apiClient.IsConnected()
+
+		// Si el estado cambió, emitir evento
+		if currentStatus != a.lastConnectionStatus {
+			a.lastConnectionStatus = currentStatus
+
+			connectionStatus := a.GetConnectionStatus()
+
+			// Emitir evento de Wails
+			runtime.EventsEmit(a.ctx, "connection_status_update", connectionStatus)
+
+			log.Printf("Connection status changed to: %s", connectionStatus.Status)
+		}
+	}
 }
 
 // HandleClientLogin maneja el login del cliente
@@ -235,7 +294,17 @@ func (a *App) startHeartbeat() {
 				err := a.apiClient.SendHeartbeat()
 				if err != nil {
 					log.Printf("Failed to send heartbeat: %v", err)
+
+					// Solo emitir evento si es un error grave que cambió el estado
+					if !a.apiClient.IsConnected() && a.lastConnectionStatus {
+						connectionStatus := a.GetConnectionStatus()
+						connectionStatus.ErrorMessage = fmt.Sprintf("Heartbeat failed: %v", err)
+						runtime.EventsEmit(a.ctx, "connection_status_update", connectionStatus)
+						a.lastConnectionStatus = false
+					}
 				}
+			} else {
+				log.Println("Skipping heartbeat: not connected")
 			}
 		}
 	}()

@@ -1,5 +1,5 @@
 <script>
-    import { onMount } from 'svelte';
+    import { onMount, onDestroy } from 'svelte';
     import { 
         HandlePCRegistration, 
         GetSessionInfo, 
@@ -7,6 +7,7 @@
         IsConnected, 
         Logout 
     } from '../../wailsjs/go/main/App.js';
+    import { EventsOn, EventsOff } from '../../wailsjs/runtime/runtime.js';
     import { 
         setRegistered, 
         setConnected, 
@@ -24,13 +25,48 @@
     let loading = false;
     let error = null;
     let registrationStatus = 'pending'; // 'pending', 'registering', 'registered', 'error'
+    let connectionStatus = {
+        isConnected: false,
+        status: 'disconnected',
+        lastHeartbeat: 0,
+        serverUrl: '',
+        connectionTime: 0,
+        errorMessage: ''
+    };
+    
+    // Variable para cleanup del event listener
+    let eventCleanup = null;
     
     onMount(async () => {
         await loadInitialData();
         await checkRegistration();
+        await updateConnectionStatus();
         
-        // Verificar conexión cada 10 segundos
-        setInterval(checkConnection, 10000);
+        // Esperar un poco antes de suscribirse a eventos para asegurar que el contexto esté listo
+        setTimeout(() => {
+            try {
+                // Suscribirse a eventos de estado de conexión
+                eventCleanup = EventsOn("connection_status_update", handleConnectionStatusUpdate);
+                console.log("✅ Event listener registrado para connection_status_update");
+            } catch (err) {
+                console.error("❌ Error registrando event listener:", err);
+            }
+        }, 1000);
+        
+        // Verificar conexión cada 30 segundos como fallback
+        setInterval(updateConnectionStatus, 30000);
+    });
+    
+    onDestroy(() => {
+        // Limpiar event listener
+        if (eventCleanup) {
+            try {
+                EventsOff("connection_status_update");
+                console.log("✅ Event listener removido correctamente");
+            } catch (err) {
+                console.error("❌ Error removiendo event listener:", err);
+            }
+        }
     });
     
     async function loadInitialData() {
@@ -46,20 +82,61 @@
             // Cargar información del sistema
             systemInfo = await GetSystemInfo();
             
-            // Verificar conexión
-            await checkConnection();
         } catch (err) {
             console.error('Error loading initial data:', err);
             setError('Error cargando datos iniciales');
         }
     }
     
-    async function checkConnection() {
+    async function updateConnectionStatus() {
         try {
+            // Usar IsConnected como base y construir el objeto connectionStatus
             const connected = await IsConnected();
+            connectionStatus = {
+                isConnected: connected,
+                status: connected ? 'connected' : 'disconnected',
+                lastHeartbeat: Date.now() / 1000,
+                serverUrl: 'localhost:8080',
+                connectionTime: Date.now() / 1000,
+                errorMessage: ''
+            };
             setConnected(connected);
+            
+            // Log para debug
+            console.log('Connection status updated:', connectionStatus);
         } catch (err) {
+            console.error('Error getting connection status:', err);
+            connectionStatus = {
+                isConnected: false,
+                status: 'error',
+                lastHeartbeat: Date.now() / 1000,
+                serverUrl: 'localhost:8080',
+                connectionTime: Date.now() / 1000,
+                errorMessage: err.message
+            };
             setConnected(false);
+        }
+    }
+    
+    function handleConnectionStatusUpdate(newStatus) {
+        console.log("🔄 Connection status event received:", newStatus);
+        
+        if (!newStatus) {
+            console.warn("⚠️ Event recibido sin datos");
+            return;
+        }
+        
+        connectionStatus = { ...newStatus };
+        setConnected(newStatus.isConnected);
+        
+        // Mostrar notificación si hay cambio de estado
+        if (newStatus.isConnected) {
+            console.log('✅ Conexión establecida con el servidor');
+        } else {
+            console.log('❌ Conexión perdida con el servidor');
+            if (newStatus.errorMessage) {
+                console.log('💥 Error:', newStatus.errorMessage);
+            }
         }
     }
     
@@ -137,6 +214,20 @@
             default: return 'Pendiente';
         }
     }
+    
+    function getConnectionStatusColor(status) {
+        switch (status) {
+            case 'connected': return '#10b981';
+            case 'disconnected': return '#ef4444';
+            case 'error': return '#dc2626';
+            default: return '#6b7280';
+        }
+    }
+    
+    function formatTimestamp(timestamp) {
+        if (!timestamp) return 'N/A';
+        return new Date(timestamp * 1000).toLocaleTimeString('es-ES');
+    }
 </script>
 
 <div class="dashboard-container">
@@ -158,13 +249,39 @@
             <div class="status-card">
                 <div class="status-header">
                     <h3>Estado de Conexión</h3>
-                    <div class="status-indicator" class:connected={$isConnected} class:disconnected={!$isConnected}>
-                        {$isConnected ? 'Conectado' : 'Desconectado'}
+                    <div class="status-indicator" style="background-color: {getConnectionStatusColor(connectionStatus.status)}">
+                        <div class="status-dot" class:connected={connectionStatus.isConnected} class:disconnected={!connectionStatus.isConnected}></div>
+                        {connectionStatus.isConnected ? 'Conectado' : 'Desconectado'}
                     </div>
                 </div>
                 <div class="status-details">
-                    <p><strong>Servidor:</strong> localhost:8080</p>
-                    <p><strong>Usuario ID:</strong> {sessionData.userId || 'N/A'}</p>
+                    <div class="connection-info">
+                        <div class="info-item">
+                            <span class="info-label">Servidor:</span>
+                            <span class="info-value">localhost:8080</span>
+                        </div>
+                        <div class="info-item">
+                            <span class="info-label">Usuario ID:</span>
+                            <span class="info-value">{sessionData.userId || 'N/A'}</span>
+                        </div>
+                        <div class="info-item">
+                            <span class="info-label">Estado:</span>
+                            <span class="info-value" style="color: {getConnectionStatusColor(connectionStatus.status)}">
+                                {connectionStatus.status === 'connected' ? 'Conectado' : 
+                                 connectionStatus.status === 'disconnected' ? 'Desconectado' : 'Error'}
+                            </span>
+                        </div>
+                        <div class="info-item">
+                            <span class="info-label">Último heartbeat:</span>
+                            <span class="info-value">{formatTimestamp(connectionStatus.lastHeartbeat)}</span>
+                        </div>
+                        {#if connectionStatus.errorMessage}
+                            <div class="info-item error">
+                                <span class="info-label">Error:</span>
+                                <span class="info-value error">{connectionStatus.errorMessage}</span>
+                            </div>
+                        {/if}
+                    </div>
                 </div>
             </div>
             
@@ -346,16 +463,68 @@
         font-weight: 600;
         text-transform: uppercase;
         letter-spacing: 0.5px;
-    }
-    
-    .status-indicator.connected {
-        background-color: #10b981;
+        display: flex;
+        align-items: center;
+        gap: 6px;
         color: white;
     }
     
-    .status-indicator.disconnected {
-        background-color: #ef4444;
-        color: white;
+    .status-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        animation: pulse 2s infinite;
+    }
+    
+    .status-dot.connected {
+        background: #10b981;
+    }
+    
+    .status-dot.disconnected {
+        background: #ef4444;
+    }
+    
+    @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.6; }
+    }
+    
+    .connection-info {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+    }
+    
+    .info-item {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 4px 0;
+    }
+    
+    .info-item.error {
+        margin-top: 8px;
+        padding: 8px;
+        background: #fef2f2;
+        border-radius: 6px;
+        border: 1px solid #fecaca;
+    }
+    
+    .info-label {
+        font-weight: 500;
+        color: #4b5563;
+        font-size: 14px;
+    }
+    
+    .info-value {
+        font-weight: 600;
+        color: #1f2937;
+        font-size: 14px;
+    }
+    
+    .info-value.error {
+        color: #dc2626;
+        font-size: 12px;
     }
     
     .status-details {

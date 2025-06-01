@@ -35,7 +35,7 @@ func NewAPIClient(serverURL string) *APIClient {
 		authResponse:   make(chan ClientAuthResponse, 1),
 		regResponse:    make(chan PCRegistrationResponse, 1),
 		connectTimeout: 10 * time.Second,
-		readTimeout:    30 * time.Second,
+		readTimeout:    90 * time.Second,
 		writeTimeout:   10 * time.Second,
 	}
 }
@@ -82,6 +82,9 @@ func (c *APIClient) Connect() error {
 	// Iniciar goroutine para leer mensajes
 	go c.readMessages()
 
+	// Iniciar keep-alive con pings
+	go c.startKeepAlive()
+
 	log.Println("WebSocket connection established")
 	return nil
 }
@@ -115,6 +118,11 @@ func (c *APIClient) IsConnected() bool {
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()
 	return c.isConnected
+}
+
+// GetServerURL obtiene la URL del servidor
+func (c *APIClient) GetServerURL() string {
+	return c.serverURL
 }
 
 // ConnectAndAuthenticate establece conexión y autentica al usuario
@@ -177,7 +185,11 @@ func (c *APIClient) RegisterPC(pcIdentifier string) (*PCRegistrationResponse, er
 
 // SendHeartbeat envía un heartbeat al servidor
 func (c *APIClient) SendHeartbeat() error {
-	if !c.IsConnected() {
+	c.mutex.RLock()
+	connected := c.isConnected
+	c.mutex.RUnlock()
+
+	if !connected {
 		return fmt.Errorf("not connected to server")
 	}
 
@@ -188,7 +200,26 @@ func (c *APIClient) SendHeartbeat() error {
 		},
 	}
 
-	return c.sendMessage(hbReq)
+	err := c.sendMessage(hbReq)
+	if err != nil {
+		// Solo marcar como desconectado si es un error grave de WebSocket
+		if websocket.IsCloseError(err, websocket.CloseAbnormalClosure, websocket.CloseGoingAway) {
+			c.mutex.Lock()
+			c.isConnected = false
+			if c.conn != nil {
+				c.conn.Close()
+				c.conn = nil
+			}
+			c.mutex.Unlock()
+			log.Printf("Heartbeat failed with close error, marking as disconnected: %v", err)
+		} else {
+			// Para otros errores, solo logear pero no desconectar
+			log.Printf("Heartbeat failed but connection may still be active: %v", err)
+		}
+		return err
+	}
+
+	return nil
 }
 
 // sendMessage envía un mensaje WebSocket
@@ -219,6 +250,12 @@ func (c *APIClient) readMessages() {
 		log.Println("WebSocket read goroutine ended")
 	}()
 
+	// Configurar ping handler para mantener conexión viva
+	c.conn.SetPingHandler(func(appData string) error {
+		log.Println("Received ping, sending pong")
+		return c.conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(10*time.Second))
+	})
+
 	for {
 		c.mutex.RLock()
 		conn := c.conn
@@ -229,16 +266,24 @@ func (c *APIClient) readMessages() {
 			break
 		}
 
-		// Establecer timeout de lectura
+		// Establecer timeout de lectura más largo
 		conn.SetReadDeadline(time.Now().Add(c.readTimeout))
 
 		var message WebSocketMessage
 		err := conn.ReadJSON(&message)
 		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+			// Solo cerrar en errores graves, no en timeouts de lectura
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure, websocket.CloseNormalClosure) {
 				log.Printf("WebSocket error: %v", err)
+				break
+			} else if netErr, ok := err.(*websocket.CloseError); ok {
+				log.Printf("WebSocket closed: %v", netErr)
+				break
+			} else {
+				// Para timeouts y otros errores temporales, continuar
+				log.Printf("WebSocket read timeout or temporary error: %v", err)
+				continue
 			}
-			break
 		}
 
 		// Procesar mensaje
@@ -279,5 +324,32 @@ func (c *APIClient) handleMessage(message WebSocketMessage) {
 
 	default:
 		log.Printf("Unknown message type: %s", message.Type)
+	}
+}
+
+// startKeepAlive envía pings periódicos para mantener la conexión viva
+func (c *APIClient) startKeepAlive() {
+	ticker := time.NewTicker(20 * time.Second) // Ping cada 20 segundos
+	defer ticker.Stop()
+
+	for range ticker.C {
+		c.mutex.RLock()
+		conn := c.conn
+		connected := c.isConnected
+		c.mutex.RUnlock()
+
+		if !connected || conn == nil {
+			log.Println("Keep-alive stopped: not connected")
+			break
+		}
+
+		// Enviar ping
+		err := conn.WriteControl(websocket.PingMessage, []byte("ping"), time.Now().Add(10*time.Second))
+		if err != nil {
+			log.Printf("Failed to send ping: %v", err)
+			// No cerrar conexión por error de ping, solo logear
+		} else {
+			log.Println("Sent ping to server")
+		}
 	}
 }

@@ -37,6 +37,33 @@ export namespace api {
 
 }
 
+export namespace main {
+	
+	export class ConnectionStatus {
+	    isConnected: boolean;
+	    status: string;
+	    lastHeartbeat: number;
+	    serverUrl: string;
+	    connectionTime: number;
+	    errorMessage?: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new ConnectionStatus(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.isConnected = source["isConnected"];
+	        this.status = source["status"];
+	        this.lastHeartbeat = source["lastHeartbeat"];
+	        this.serverUrl = source["serverUrl"];
+	        this.connectionTime = source["connectionTime"];
+	        this.errorMessage = source["errorMessage"];
+	    }
+	}
+
+}
+
 export namespace session {
 	
 	export class SessionData {

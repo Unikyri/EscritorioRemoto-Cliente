@@ -326,6 +326,7 @@ Video.
 ## 6. Estructura de Carpetas (Proyecto Wails Cliente)
 
 Basada en una estructura típica de Wails y el modelo de paquetes del cliente.
+```
 / (raíz del proyecto Cliente)
 |-- frontend/                   # Código del frontend (HTML, CSS, JS/Svelte)
 |   |-- src/
@@ -351,3 +352,4 @@ Basada en una estructura típica de Wails y el modelo de paquetes del cliente.
 |-- wails.json                  # Configuración del proyecto Wails
 |-- build/                      # Directorio de salida de los binarios compilados
 |-- README.md
+```

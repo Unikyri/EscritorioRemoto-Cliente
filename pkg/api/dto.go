@@ -25,6 +25,14 @@ const (
 	MessageTypePCRegistrationResp = "PC_REGISTRATION_RESPONSE"
 	MessageTypeHeartbeat          = "HEARTBEAT"
 	MessageTypeHeartbeatResp      = "HEARTBEAT_RESPONSE"
+	
+	// Remote Control Messages
+	MessageTypeRemoteControlRequest = "remote_control_request"
+	MessageTypeSessionAccepted      = "session_accepted"
+	MessageTypeSessionRejected      = "session_rejected"
+	MessageTypeSessionStarted       = "session_started"
+	MessageTypeSessionEnded         = "session_ended"
+	MessageTypeSessionFailed        = "session_failed"
 )
 
 // Base message structure
@@ -66,4 +74,21 @@ type HeartbeatRequest struct {
 type HeartbeatResponse struct {
 	Timestamp int64  `json:"timestamp"`
 	Status    string `json:"status"`
+}
+
+// Remote Control Messages
+type RemoteControlRequest struct {
+	SessionID     string `json:"session_id"`
+	AdminUserID   string `json:"admin_user_id"`
+	ClientPCID    string `json:"client_pc_id"`
+	AdminUsername string `json:"admin_username,omitempty"`
+}
+
+type SessionAcceptedMessage struct {
+	SessionID string `json:"session_id"`
+}
+
+type SessionRejectedMessage struct {
+	SessionID string `json:"session_id"`
+	Reason    string `json:"reason,omitempty"`
 }

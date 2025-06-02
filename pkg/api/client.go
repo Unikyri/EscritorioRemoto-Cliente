@@ -11,6 +11,9 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// RemoteControlRequestHandler es el callback para manejar solicitudes de control remoto
+type RemoteControlRequestHandler func(request RemoteControlRequest)
+
 // APIClient maneja la comunicación WebSocket con el servidor
 type APIClient struct {
 	serverURL   string
@@ -21,6 +24,9 @@ type APIClient struct {
 	// Channels para manejar respuestas
 	authResponse chan ClientAuthResponse
 	regResponse  chan PCRegistrationResponse
+
+	// Handler para solicitudes de control remoto
+	remoteControlHandler RemoteControlRequestHandler
 
 	// Configuración
 	connectTimeout time.Duration
@@ -38,6 +44,13 @@ func NewAPIClient(serverURL string) *APIClient {
 		readTimeout:    90 * time.Second,
 		writeTimeout:   10 * time.Second,
 	}
+}
+
+// SetRemoteControlHandler establece el handler para solicitudes de control remoto
+func (c *APIClient) SetRemoteControlHandler(handler RemoteControlRequestHandler) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	c.remoteControlHandler = handler
 }
 
 // Connect establece la conexión WebSocket con el servidor
@@ -162,11 +175,15 @@ func (c *APIClient) RegisterPC(pcIdentifier string) (*PCRegistrationResponse, er
 		return nil, fmt.Errorf("not connected to server")
 	}
 
+	// Obtener IP del cliente (por ahora usar 127.0.0.1 para desarrollo local)
+	clientIP := "127.0.0.1"
+
 	// Enviar solicitud de registro
 	regReq := WebSocketMessage{
 		Type: MessageTypePCRegistration,
 		Data: PCRegistrationRequest{
 			PCIdentifier: pcIdentifier,
+			IP:           clientIP,
 		},
 	}
 
@@ -256,6 +273,9 @@ func (c *APIClient) readMessages() {
 		return c.conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(10*time.Second))
 	})
 
+	consecutiveErrors := 0
+	maxConsecutiveErrors := 3
+
 	for {
 		c.mutex.RLock()
 		conn := c.conn
@@ -272,19 +292,29 @@ func (c *APIClient) readMessages() {
 		var message WebSocketMessage
 		err := conn.ReadJSON(&message)
 		if err != nil {
-			// Solo cerrar en errores graves, no en timeouts de lectura
+			consecutiveErrors++
+
+			// Verificar si la conexión está cerrada definitivamente
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure, websocket.CloseNormalClosure) {
 				log.Printf("WebSocket error: %v", err)
 				break
 			} else if netErr, ok := err.(*websocket.CloseError); ok {
 				log.Printf("WebSocket closed: %v", netErr)
 				break
+			} else if consecutiveErrors >= maxConsecutiveErrors {
+				// Si hay muchos errores consecutivos, cerrar la conexión
+				log.Printf("Too many consecutive WebSocket errors (%d), closing connection. Last error: %v", consecutiveErrors, err)
+				break
 			} else {
-				// Para timeouts y otros errores temporales, continuar
-				log.Printf("WebSocket read timeout or temporary error: %v", err)
+				// Para timeouts y otros errores temporales, continuar pero con límite
+				log.Printf("WebSocket read timeout or temporary error (%d/%d): %v", consecutiveErrors, maxConsecutiveErrors, err)
+				time.Sleep(time.Duration(consecutiveErrors) * time.Second) // Backoff progresivo
 				continue
 			}
 		}
+
+		// Reset contador de errores si se lee exitosamente
+		consecutiveErrors = 0
 
 		// Procesar mensaje
 		c.handleMessage(message)
@@ -322,6 +352,41 @@ func (c *APIClient) handleMessage(message WebSocketMessage) {
 		// Heartbeat response, no action needed
 		log.Println("Heartbeat response received")
 
+	case MessageTypeRemoteControlRequest:
+		// Manejar solicitud de control remoto
+		var request RemoteControlRequest
+		if data, err := json.Marshal(message.Data); err == nil {
+			if err := json.Unmarshal(data, &request); err == nil {
+				c.mutex.RLock()
+				handler := c.remoteControlHandler
+				c.mutex.RUnlock()
+
+				if handler != nil {
+					log.Printf("Received remote control request from admin: %s (Session: %s)",
+						request.AdminUsername, request.SessionID)
+					handler(request)
+				} else {
+					log.Println("Received remote control request but no handler set")
+				}
+			} else {
+				log.Printf("Failed to unmarshal remote control request: %v", err)
+			}
+		} else {
+			log.Printf("Failed to marshal remote control request data: %v", err)
+		}
+
+	case MessageTypeSessionStarted:
+		log.Println("Remote control session started")
+		// TODO: Implementar lógica para sesión iniciada
+
+	case MessageTypeSessionEnded:
+		log.Println("Remote control session ended")
+		// TODO: Implementar lógica para sesión terminada
+
+	case MessageTypeSessionFailed:
+		log.Println("Remote control session failed")
+		// TODO: Implementar lógica para sesión fallida
+
 	default:
 		log.Printf("Unknown message type: %s", message.Type)
 	}
@@ -352,4 +417,37 @@ func (c *APIClient) startKeepAlive() {
 			log.Println("Sent ping to server")
 		}
 	}
+}
+
+// AcceptRemoteControlSession acepta una sesión de control remoto
+func (c *APIClient) AcceptRemoteControlSession(sessionID string) error {
+	if !c.IsConnected() {
+		return fmt.Errorf("not connected to server")
+	}
+
+	message := WebSocketMessage{
+		Type: MessageTypeSessionAccepted,
+		Data: SessionAcceptedMessage{
+			SessionID: sessionID,
+		},
+	}
+
+	return c.sendMessage(message)
+}
+
+// RejectRemoteControlSession rechaza una sesión de control remoto
+func (c *APIClient) RejectRemoteControlSession(sessionID, reason string) error {
+	if !c.IsConnected() {
+		return fmt.Errorf("not connected to server")
+	}
+
+	message := WebSocketMessage{
+		Type: MessageTypeSessionRejected,
+		Data: SessionRejectedMessage{
+			SessionID: sessionID,
+			Reason:    reason,
+		},
+	}
+
+	return c.sendMessage(message)
 }

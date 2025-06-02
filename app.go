@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"time"
 
 	"EscritorioRemoto-Cliente/internal/controller"
 	"EscritorioRemoto-Cliente/internal/infrastructure/patterns/factory"
@@ -23,6 +24,9 @@ type App struct {
 
 	// API Client para control remoto
 	apiClient *api.APIClient
+
+	// Timer para heartbeat automático
+	heartbeatTicker *time.Ticker
 }
 
 // NewApp crea una nueva instancia de App usando MVC
@@ -111,6 +115,9 @@ func (a *App) setupRemoteControlHandler() {
 
 // shutdown es llamado cuando la app se cierra (Wails)
 func (a *App) shutdown(ctx context.Context) {
+	// Detener heartbeat automático
+	a.stopHeartbeat()
+
 	if err := a.appController.Shutdown(); err != nil {
 		runtime.LogErrorf(ctx, "Error during shutdown: %v", err)
 	}
@@ -126,14 +133,14 @@ func (a *App) Login(username, password string) map[string]interface{} {
 
 	// 1. Verificar si ya está conectado, si no, conectar al servidor
 	serverURL := "http://localhost:8080" // URL completa con esquema
-	
+
 	// Verificar estado de conexión actual
 	connectionStatus := a.appController.GetConnectionStatus()
 	isConnected := false
 	if connectionStatus.ConnectionInfo != nil {
 		isConnected = connectionStatus.ConnectionInfo.IsConnected
 	}
-	
+
 	if !isConnected {
 		runtime.LogInfof(a.ctx, "Not connected, attempting to connect to server...")
 		connectResponse := a.appController.Connect(serverURL)
@@ -197,6 +204,9 @@ func (a *App) Login(username, password string) map[string]interface{} {
 						"serverUrl": serverURL,
 					})
 
+					// 6. Iniciar heartbeat automático
+					a.startHeartbeat()
+
 					// NOTA: Ya no registramos automáticamente el PC aquí
 					// El usuario debe usar el botón "Registrar PC" en la UI
 					runtime.LogInfof(a.ctx, "Login completed. Use 'Register PC' button to register this computer.")
@@ -226,16 +236,19 @@ func (a *App) Login(username, password string) map[string]interface{} {
 func (a *App) Logout() map[string]interface{} {
 	runtime.LogInfof(a.ctx, "Starting logout process")
 
-	// 1. Desconectar del servidor
+	// 1. Detener heartbeat automático
+	a.stopHeartbeat()
+
+	// 2. Desconectar del servidor
 	disconnectResponse := a.appController.Disconnect()
 	if !disconnectResponse.Success {
 		runtime.LogWarningf(a.ctx, "Failed to disconnect cleanly: %s", disconnectResponse.Error)
 	}
 
-	// 2. Logout local
+	// 3. Logout local
 	logoutResponse := a.appController.Logout()
 
-	// 3. Emitir evento de logout
+	// 4. Emitir evento de logout
 	runtime.EventsEmit(a.ctx, "logout_completed", map[string]interface{}{
 		"reason": "user_requested",
 	})
@@ -370,6 +383,49 @@ func (a *App) GetSystemInfo() map[string]interface{} {
 // IsAuthenticated verifica si está autenticado
 func (a *App) IsAuthenticated() bool {
 	return a.appController.IsAuthenticated()
+}
+
+// ===== HEARTBEAT AUTOMÁTICO =====
+
+// startHeartbeat inicia el heartbeat automático cada 30 segundos
+func (a *App) startHeartbeat() {
+	// Detener heartbeat anterior si existe
+	a.stopHeartbeat()
+
+	if a.apiClient == nil {
+		runtime.LogWarningf(a.ctx, "Cannot start heartbeat: API client is nil")
+		return
+	}
+
+	// Crear ticker para heartbeat cada 30 segundos
+	a.heartbeatTicker = time.NewTicker(30 * time.Second)
+
+	// Iniciar goroutine para enviar heartbeats
+	go func() {
+		runtime.LogInfof(a.ctx, "Heartbeat automático iniciado (cada 30 segundos)")
+
+		for range a.heartbeatTicker.C {
+			if a.apiClient != nil && a.apiClient.IsConnected() {
+				err := a.apiClient.SendHeartbeat()
+				if err != nil {
+					runtime.LogErrorf(a.ctx, "Heartbeat failed: %v", err)
+				} else {
+					runtime.LogDebugf(a.ctx, "Heartbeat sent successfully")
+				}
+			} else {
+				runtime.LogWarningf(a.ctx, "Heartbeat skipped: API client not connected")
+			}
+		}
+	}()
+}
+
+// stopHeartbeat detiene el heartbeat automático
+func (a *App) stopHeartbeat() {
+	if a.heartbeatTicker != nil {
+		a.heartbeatTicker.Stop()
+		a.heartbeatTicker = nil
+		runtime.LogInfof(a.ctx, "Heartbeat automático detenido")
+	}
 }
 
 // ===== MÉTODOS DE CONTROL REMOTO =====

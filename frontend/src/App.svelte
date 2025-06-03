@@ -4,6 +4,7 @@
   import MainDashboardView from './components/MainDashboardView.svelte';
   import RemoteControlDialog from './components/RemoteControlDialog.svelte';
   import VideoRecordingIndicator from './components/VideoRecordingIndicator.svelte';
+  import FileTransferNotification from './components/FileTransferNotification.svelte';
   import { 
     isAuthenticated, 
     appState, 
@@ -174,6 +175,9 @@
 
   <!-- Indicador de Grabación de Video -->
   <VideoRecordingIndicator />
+
+  <!-- Notificaciones de Transferencia de Archivos -->
+  <FileTransferNotification />
 </main>
 
 <style>

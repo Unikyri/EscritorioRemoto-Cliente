@@ -10,9 +10,13 @@ export function Connect(arg1:string):Promise<Record<string, any>>;
 
 export function Disconnect():Promise<Record<string, any>>;
 
+export function GetActiveFileTransfers():Promise<Record<string, any>>;
+
 export function GetAppStatus():Promise<Record<string, any>>;
 
 export function GetConnectionStatus():Promise<Record<string, any>>;
+
+export function GetFileTransferDirectory():Promise<Record<string, any>>;
 
 export function GetPCInfo():Promise<Record<string, any>>;
 

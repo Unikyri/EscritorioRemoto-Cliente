@@ -18,12 +18,20 @@ export function Disconnect() {
   return window['go']['main']['App']['Disconnect']();
 }
 
+export function GetActiveFileTransfers() {
+  return window['go']['main']['App']['GetActiveFileTransfers']();
+}
+
 export function GetAppStatus() {
   return window['go']['main']['App']['GetAppStatus']();
 }
 
 export function GetConnectionStatus() {
   return window['go']['main']['App']['GetConnectionStatus']();
+}
+
+export function GetFileTransferDirectory() {
+  return window['go']['main']['App']['GetFileTransferDirectory']();
 }
 
 export function GetPCInfo() {

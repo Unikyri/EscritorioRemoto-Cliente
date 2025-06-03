@@ -21,6 +21,12 @@ type SessionEventHandler func(eventType string, data interface{})
 // InputCommandHandler es el callback para manejar comandos de input entrantes
 type InputCommandHandler func(command InputCommand)
 
+// FileTransferRequestHandler es el callback para manejar solicitudes de transferencia de archivos
+type FileTransferRequestHandler func(request FileTransferRequest)
+
+// FileChunkHandler es el callback para manejar chunks de archivos recibidos
+type FileChunkHandler func(chunk FileChunk)
+
 // APIClient maneja la comunicación WebSocket con el servidor
 type APIClient struct {
 	serverURL   string
@@ -41,6 +47,10 @@ type APIClient struct {
 
 	// Handler para comandos de input entrantes
 	inputCommandHandler InputCommandHandler
+
+	// Handlers para transferencia de archivos
+	fileTransferRequestHandler FileTransferRequestHandler
+	fileChunkHandler           FileChunkHandler
 
 	// Configuración
 	connectTimeout time.Duration
@@ -79,6 +89,20 @@ func (c *APIClient) SetInputCommandHandler(handler InputCommandHandler) {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 	c.inputCommandHandler = handler
+}
+
+// SetFileTransferRequestHandler establece el handler para solicitudes de transferencia de archivos
+func (c *APIClient) SetFileTransferRequestHandler(handler FileTransferRequestHandler) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	c.fileTransferRequestHandler = handler
+}
+
+// SetFileChunkHandler establece el handler para chunks de archivos recibidos
+func (c *APIClient) SetFileChunkHandler(handler FileChunkHandler) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	c.fileChunkHandler = handler
 }
 
 // Connect establece la conexión WebSocket con el servidor
@@ -498,6 +522,54 @@ func (c *APIClient) handleMessage(message WebSocketMessage) {
 		// Confirmación del backend de que la grabación fue procesada exitosamente
 		log.Println("✅ Video recording finalized confirmation received from backend")
 
+	case MessageTypeFileTransferRequest:
+		log.Printf("📁 DEBUG: Processing file transfer request")
+		// Manejar solicitud de transferencia de archivo
+		var request FileTransferRequest
+		if data, err := json.Marshal(message.Data); err == nil {
+			if err := json.Unmarshal(data, &request); err == nil {
+				c.mutex.RLock()
+				handler := c.fileTransferRequestHandler
+				c.mutex.RUnlock()
+
+				if handler != nil {
+					log.Printf("📁 Received file transfer request: %s (%.2f MB, %d chunks)",
+						request.FileName, request.FileSizeMB, request.TotalChunks)
+					handler(request)
+				} else {
+					log.Println("📁 Received file transfer request but no handler set")
+				}
+			} else {
+				log.Printf("❌ Failed to unmarshal file transfer request: %v", err)
+			}
+		} else {
+			log.Printf("❌ Failed to marshal file transfer request data: %v", err)
+		}
+
+	case MessageTypeFileChunk:
+		log.Printf("📦 DEBUG: Processing file chunk")
+		// Manejar chunk de archivo
+		var chunk FileChunk
+		if data, err := json.Marshal(message.Data); err == nil {
+			if err := json.Unmarshal(data, &chunk); err == nil {
+				c.mutex.RLock()
+				handler := c.fileChunkHandler
+				c.mutex.RUnlock()
+
+				if handler != nil {
+					log.Printf("📦 Received file chunk %d/%d for transfer %s",
+						chunk.ChunkIndex+1, chunk.TotalChunks, chunk.TransferID)
+					handler(chunk)
+				} else {
+					log.Println("📦 Received file chunk but no handler set")
+				}
+			} else {
+				log.Printf("❌ Failed to unmarshal file chunk: %v", err)
+			}
+		} else {
+			log.Printf("❌ Failed to marshal file chunk data: %v", err)
+		}
+
 	default:
 		log.Printf("🔍 DEBUG: Unknown message type: %s", message.Type)
 	}
@@ -697,5 +769,30 @@ func (c *APIClient) SendVideoRecordingComplete(videoID string, sessionID string,
 	log.Printf("🚀 Enviando metadatos de fin de grabación: VideoID=%s, SessionID=%s, Frames=%d, FPS=%.2f, Duración=%.2fs",
 		videoID, sessionID, totalFrames, fps, durationSeconds)
 
+	return c.sendMessage(message)
+}
+
+// SendFileTransferAcknowledgement envía confirmación de recepción de archivo al servidor
+func (c *APIClient) SendFileTransferAcknowledgement(transferID, sessionID string, success bool, errorMessage, filePath, fileChecksum string) error {
+	if !c.IsConnected() {
+		return fmt.Errorf("not connected to server")
+	}
+
+	ack := FileTransferAcknowledgement{
+		TransferID:   transferID,
+		SessionID:    sessionID,
+		Success:      success,
+		ErrorMessage: errorMessage,
+		FilePath:     filePath,
+		FileChecksum: fileChecksum,
+		Timestamp:    time.Now().Unix(),
+	}
+
+	message := WebSocketMessage{
+		Type: MessageTypeFileTransferAck,
+		Data: ack,
+	}
+
+	log.Printf("📤 Sending file transfer acknowledgement: Transfer=%s, Success=%v", transferID, success)
 	return c.sendMessage(message)
 }

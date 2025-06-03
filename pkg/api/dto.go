@@ -39,6 +39,11 @@ const (
 	MessageTypeInputCommand           = "input_command"
 	MessageTypeVideoFrameUpload       = "video_frame_upload"
 	MessageTypeVideoRecordingComplete = "video_recording_complete"
+
+	// File Transfer Messages
+	MessageTypeFileTransferRequest = "file_transfer_request"
+	MessageTypeFileChunk           = "file_chunk"
+	MessageTypeFileTransferAck     = "file_transfer_acknowledgement"
 )
 
 // Base message structure
@@ -99,7 +104,6 @@ type SessionRejectedMessage struct {
 	Reason    string `json:"reason,omitempty"`
 }
 
-
 // ScreenFrame represents a captured screen frame
 type ScreenFrame struct {
 	SessionID   string `json:"session_id"`
@@ -154,4 +158,38 @@ type VideoRecordingCompletePayload struct {
 	FPS             float64 `json:"fps"`
 	DurationSeconds float64 `json:"duration_seconds"`
 	Timestamp       int64   `json:"timestamp"`
+}
+
+// FileTransferRequest represents a file transfer request from server to client
+type FileTransferRequest struct {
+	TransferID      string  `json:"transfer_id"`
+	SessionID       string  `json:"session_id"`
+	FileName        string  `json:"file_name"`
+	FileSizeMB      float64 `json:"file_size_mb"`
+	TotalChunks     int     `json:"total_chunks"`
+	DestinationPath string  `json:"destination_path"`
+	Timestamp       int64   `json:"timestamp"`
+}
+
+// FileChunk represents a chunk of file data being transferred
+type FileChunk struct {
+	TransferID    string `json:"transfer_id"`
+	SessionID     string `json:"session_id"`
+	ChunkIndex    int    `json:"chunk_index"`
+	TotalChunks   int    `json:"total_chunks"`
+	ChunkData     []byte `json:"chunk_data"`
+	IsLastChunk   bool   `json:"is_last_chunk"`
+	ChunkChecksum string `json:"chunk_checksum,omitempty"`
+	Timestamp     int64  `json:"timestamp"`
+}
+
+// FileTransferAcknowledgement represents the client's response after receiving a file
+type FileTransferAcknowledgement struct {
+	TransferID   string `json:"transfer_id"`
+	SessionID    string `json:"session_id"`
+	Success      bool   `json:"success"`
+	ErrorMessage string `json:"error_message,omitempty"`
+	FilePath     string `json:"file_path,omitempty"`
+	FileChecksum string `json:"file_checksum,omitempty"`
+	Timestamp    int64  `json:"timestamp"`
 }

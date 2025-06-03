@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -11,6 +13,7 @@ import (
 	"EscritorioRemoto-Cliente/internal/infrastructure/patterns/observer"
 	"EscritorioRemoto-Cliente/internal/infrastructure/patterns/singleton"
 	"EscritorioRemoto-Cliente/pkg/api"
+	"EscritorioRemoto-Cliente/pkg/filetransfer"
 	"EscritorioRemoto-Cliente/pkg/remotecontrol"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
@@ -67,6 +70,36 @@ type App struct {
 
 	// Timer para heartbeat automático
 	heartbeatTicker *time.Ticker
+
+	// FileTransferAgent para transferencia de archivos
+	fileTransferAgent *filetransfer.FileTransferAgent
+}
+
+// getDownloadsDirectory detecta el directorio de descargas del usuario
+func getDownloadsDirectory() string {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		fmt.Printf("⚠️ No se pudo obtener directorio del usuario, usando directorio actual: %v\n", err)
+		return "./Descargas"
+	}
+
+	// Intentar diferentes nombres de directorio de descargas
+	possibleDownloadDirs := []string{
+		filepath.Join(homeDir, "Downloads"),  // Windows inglés
+		filepath.Join(homeDir, "Descargas"),  // Windows español
+		filepath.Join(homeDir, "Download"),   // Algunas variantes
+	}
+
+	for _, dir := range possibleDownloadDirs {
+		if _, err := os.Stat(dir); err == nil {
+			fmt.Printf("📁 Directorio de descargas detectado: %s\n", dir)
+			return filepath.Join(dir, "RemoteDesk")
+		}
+	}
+
+	// Si no encontramos ninguno, crear en el directorio actual
+	fmt.Printf("⚠️ No se encontró directorio de descargas estándar, usando directorio actual\n")
+	return "./Descargas/RemoteDesk"
 }
 
 // NewApp crea una nueva instancia de App usando MVC
@@ -88,12 +121,17 @@ func NewApp() *App {
 		pcService,
 	)
 
+	// Detectar directorio de descargas correcto
+	downloadDir := getDownloadsDirectory()
+	fmt.Printf("📁 Directorio de transferencias configurado: %s\n", downloadDir)
+
 	return &App{
 		appController:      appController,
 		eventManager:       eventManager,
 		configManager:      configManager,
 		remoteControlAgent: remotecontrol.NewRemoteControlAgent(),
 		videoRecorder:      remotecontrol.NewVideoRecorder(remotecontrol.DefaultVideoConfig()),
+		fileTransferAgent:  filetransfer.NewFileTransferAgent(downloadDir),
 	}
 }
 
@@ -247,6 +285,75 @@ func (a *App) setupRemoteControlHandler() {
 						err := a.remoteControlAgent.ProcessInputCommand(command)
 						if err != nil {
 							runtime.LogErrorf(a.ctx, "Failed to process input command: %v", err)
+						}
+					})
+
+					// Configurar handlers para transferencia de archivos
+					runtime.LogInfof(a.ctx, "🔍 DEBUG: Setting up file transfer handlers")
+
+					// Handler para solicitudes de transferencia de archivos
+					apiClient.SetFileTransferRequestHandler(func(request api.FileTransferRequest) {
+						runtime.LogInfof(a.ctx, "📁 File transfer request received: %s (%.2f MB)",
+							request.FileName, request.FileSizeMB)
+
+						// Procesar solicitud a través del FileTransferAgent
+						err := a.fileTransferAgent.HandleFileTransferRequest(request)
+						if err != nil {
+							runtime.LogErrorf(a.ctx, "Failed to handle file transfer request: %v", err)
+
+							// Enviar acknowledgment de error
+							if a.apiClient != nil {
+								a.apiClient.SendFileTransferAcknowledgement(
+									request.TransferID, request.SessionID, false,
+									err.Error(), "", "")
+							}
+						}
+					})
+
+					// Handler para chunks de archivos
+					apiClient.SetFileChunkHandler(func(chunk api.FileChunk) {
+						runtime.LogInfof(a.ctx, "📦 File chunk received: %d/%d for transfer %s",
+							chunk.ChunkIndex+1, chunk.TotalChunks, chunk.TransferID)
+
+						// Procesar chunk a través del FileTransferAgent
+						err := a.fileTransferAgent.HandleFileChunk(chunk)
+						if err != nil {
+							runtime.LogErrorf(a.ctx, "Failed to handle file chunk: %v", err)
+						}
+					})
+
+					// Configurar callback para cuando una transferencia se completa
+					a.fileTransferAgent.SetTransferCompletedCallback(func(transferID, fileName, filePath string, success bool, errorMsg string) {
+						runtime.LogInfof(a.ctx, "📁 File transfer completed: %s, Success: %v", fileName, success)
+
+						// Enviar acknowledgment al servidor
+						if a.apiClient != nil {
+							fileChecksum := ""
+							if success {
+								// Para MVP, no calculamos checksum en el callback
+								fileChecksum = "mvp-checksum"
+							}
+
+							err := a.apiClient.SendFileTransferAcknowledgement(
+								transferID, "", success, errorMsg, filePath, fileChecksum)
+							if err != nil {
+								runtime.LogErrorf(a.ctx, "Failed to send file transfer acknowledgement: %v", err)
+							}
+						}
+
+						// Emitir evento al frontend
+						eventData := map[string]interface{}{
+							"transfer_id": transferID,
+							"file_name":   fileName,
+							"file_path":   filePath,
+							"success":     success,
+							"error":       errorMsg,
+						}
+
+						if success {
+							runtime.EventsEmit(a.ctx, "file_received", eventData)
+						} else {
+							runtime.EventsEmit(a.ctx, "file_transfer_failed", eventData)
 						}
 					})
 
@@ -1095,7 +1202,7 @@ func (a *App) uploadVideoAsync(result *remotecontrol.RecordingResult) {
 		Duration: result.Duration,
 	})
 
-	runtime.LogInfof(a.ctx, "✅ Grabación procesada exitosamente - VideoID: %s, Frames: %d, Duración: %d segundos", 
+	runtime.LogInfof(a.ctx, "✅ Grabación procesada exitosamente - VideoID: %s, Frames: %d, Duración: %d segundos",
 		result.VideoID, result.FrameCount, result.Duration)
 }
 
@@ -1107,7 +1214,42 @@ func max(a, b int) int {
 	return b
 }
 
-// cleanupSession limpia el estado cuando la sesión se desconecta abruptamente
+// ===== MÉTODOS PARA TRANSFERENCIA DE ARCHIVOS =====
+
+// GetActiveFileTransfers retorna las transferencias de archivos activas
+func (a *App) GetActiveFileTransfers() map[string]interface{} {
+	if a.fileTransferAgent == nil {
+		return map[string]interface{}{
+			"success": false,
+			"error":   "File transfer agent not initialized",
+		}
+	}
+
+	activeTransfers := a.fileTransferAgent.GetActiveTransfers()
+
+	return map[string]interface{}{
+		"success":   true,
+		"transfers": activeTransfers,
+	}
+}
+
+// GetFileTransferDirectory retorna el directorio de descarga configurado
+func (a *App) GetFileTransferDirectory() map[string]interface{} {
+	if a.fileTransferAgent == nil {
+		return map[string]interface{}{
+			"success": false,
+			"error":   "File transfer agent not initialized",
+		}
+	}
+
+	downloadDir := a.fileTransferAgent.GetDownloadDirectory()
+
+	return map[string]interface{}{
+		"success":      true,
+		"download_dir": downloadDir,
+	}
+}
+
 func (a *App) cleanupSession() {
 	runtime.LogInfof(a.ctx, "🧹 Limpiando estado de sesión...")
 

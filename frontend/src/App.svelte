@@ -3,6 +3,7 @@
   import LoginView from './components/LoginView.svelte';
   import MainDashboardView from './components/MainDashboardView.svelte';
   import RemoteControlDialog from './components/RemoteControlDialog.svelte';
+  import VideoRecordingIndicator from './components/VideoRecordingIndicator.svelte';
   import { 
     isAuthenticated, 
     appState, 
@@ -170,6 +171,9 @@
       on:rejected={handleRemoteControlRejected}
     />
   {/if}
+
+  <!-- Indicador de Grabación de Video -->
+  <VideoRecordingIndicator />
 </main>
 
 <style>

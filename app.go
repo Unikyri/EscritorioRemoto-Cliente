@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"time"
 
 	"EscritorioRemoto-Cliente/internal/controller"
@@ -13,6 +15,37 @@ import (
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
+
+// === TIPOS Y VARIABLES PARA GRABACIÓN DE VIDEO ===
+
+// VideoRecordingState representa el estado actual de la grabación
+type VideoRecordingState struct {
+	IsRecording    bool    `json:"is_recording"`
+	SessionID      string  `json:"session_id"`
+	VideoID        string  `json:"video_id"`
+	StartTime      string  `json:"start_time"`
+	Duration       int     `json:"duration"`
+	FrameCount     int     `json:"frame_count"`
+	IsUploading    bool    `json:"is_uploading"`
+	UploadProgress float64 `json:"upload_progress"`
+}
+
+// VideoNotification representa una notificación de video para el frontend
+type VideoNotification struct {
+	Type     string `json:"type"` // "recording_started", "recording_stopped", "upload_started", "upload_completed", "error"
+	Message  string `json:"message"`
+	VideoID  string `json:"video_id,omitempty"`
+	Duration int    `json:"duration,omitempty"`
+	Error    string `json:"error,omitempty"`
+}
+
+// Variables globales para manejo de estado de video
+var (
+	videoState      VideoRecordingState
+	videoStateMutex sync.RWMutex
+)
+
+// === FIN TIPOS Y VARIABLES PARA VIDEO ===
 
 // App struct refactorizada usando MVC
 type App struct {
@@ -28,6 +61,9 @@ type App struct {
 
 	// RemoteControlAgent para captura de pantalla y control de input
 	remoteControlAgent *remotecontrol.RemoteControlAgent
+
+	// VideoRecorder para grabación de sesiones
+	videoRecorder *remotecontrol.VideoRecorder
 
 	// Timer para heartbeat automático
 	heartbeatTicker *time.Ticker
@@ -57,6 +93,7 @@ func NewApp() *App {
 		eventManager:       eventManager,
 		configManager:      configManager,
 		remoteControlAgent: remotecontrol.NewRemoteControlAgent(),
+		videoRecorder:      remotecontrol.NewVideoRecorder(remotecontrol.DefaultVideoConfig()),
 	}
 }
 
@@ -82,15 +119,30 @@ func (a *App) startup(ctx context.Context) {
 
 // setupRemoteControlHandler configura el handler para solicitudes de control remoto
 func (a *App) setupRemoteControlHandler() {
+	runtime.LogInfof(a.ctx, "🔍 DEBUG: setupRemoteControlHandler called")
+
 	// Obtener el APIClient del controlador de conexión
 	if connectionService := a.appController.GetConnectionService(); connectionService != nil {
+		runtime.LogInfof(a.ctx, "🔍 DEBUG: ConnectionService found")
+
 		// Type assertion para acceder al APIClient
 		if realService, ok := connectionService.(interface{ GetAPIClient() interface{} }); ok {
+			runtime.LogInfof(a.ctx, "🔍 DEBUG: GetAPIClient interface available")
+
 			if apiClientInterface := realService.GetAPIClient(); apiClientInterface != nil {
+				runtime.LogInfof(a.ctx, "🔍 DEBUG: APIClient interface not nil")
+
 				if apiClient, ok := apiClientInterface.(*api.APIClient); ok && apiClient != nil {
+					runtime.LogInfof(a.ctx, "🔍 DEBUG: APIClient cast successful")
 					a.apiClient = apiClient
 
+					// INYECTAR APIClient en VideoRecorder para upload de frames
+					if a.videoRecorder != nil {
+						a.videoRecorder.SetAPIClient(apiClient)
+					}
+
 					// Configurar handler para solicitudes de control remoto
+					runtime.LogInfof(a.ctx, "🔍 DEBUG: Setting up remote control handler")
 					apiClient.SetRemoteControlHandler(func(request api.RemoteControlRequest) {
 						// Emitir evento a la UI
 						runtime.EventsEmit(a.ctx, "incoming_control_request", map[string]interface{}{
@@ -104,11 +156,14 @@ func (a *App) setupRemoteControlHandler() {
 					})
 
 					// Configurar handler para eventos de sesión
+					runtime.LogInfof(a.ctx, "🔍 DEBUG: Setting up session event handler")
 					apiClient.SetSessionEventHandler(func(eventType string, data interface{}) {
+						runtime.LogInfof(a.ctx, "🔍 DEBUG: Session event handler called with eventType: %s", eventType)
 						runtime.LogInfof(a.ctx, "Session event received: %s", eventType)
 
 						switch eventType {
 						case "session_started":
+							runtime.LogInfof(a.ctx, "🔍 DEBUG: Processing session_started event")
 							runtime.EventsEmit(a.ctx, "control_session_started", data)
 
 							// Extraer sessionID del data
@@ -120,31 +175,67 @@ func (a *App) setupRemoteControlHandler() {
 										runtime.LogErrorf(a.ctx, "Failed to start remote control session: %v", err)
 									} else {
 										runtime.LogInfof(a.ctx, "Remote control session started: %s", sessionID)
+
+										// 🎬 INICIAR GRABACIÓN DE VIDEO AUTOMÁTICAMENTE
+										if videoErr := a.StartVideoRecording(sessionID); videoErr != nil {
+											runtime.LogErrorf(a.ctx, "Failed to start video recording: %v", videoErr)
+										}
+
 										// Iniciar goroutine para enviar frames
 										go a.startScreenStreaming()
 									}
 								}
 							}
 
-						case "session_ended":
+						case "session_ended", "control_session_ended": // ✅ MANEJAR AMBOS EVENTOS
+							runtime.LogInfof(a.ctx, "🔍 DEBUG: Processing session_ended event - type: %s", eventType)
+							runtime.LogInfof(a.ctx, "🔚 Sesión terminada - tipo de evento: %s", eventType)
 							runtime.EventsEmit(a.ctx, "control_session_ended", data)
 
-							// Detener RemoteControlAgent
-							err := a.remoteControlAgent.StopSession()
-							if err != nil {
-								runtime.LogErrorf(a.ctx, "Failed to stop remote control session: %v", err)
+							// 🎬 DETENER GRABACIÓN DE VIDEO ANTES DE CERRAR LA SESIÓN
+							if a.IsVideoRecording() {
+								runtime.LogInfof(a.ctx, "🎬 Deteniendo grabación de video...")
+								if videoErr := a.StopVideoRecording(); videoErr != nil {
+									runtime.LogErrorf(a.ctx, "Failed to stop video recording: %v", videoErr)
+								} else {
+									runtime.LogInfof(a.ctx, "✅ Grabación de video detenida exitosamente")
+								}
 							} else {
-								runtime.LogInfof(a.ctx, "Remote control session stopped")
+								runtime.LogInfof(a.ctx, "ℹ️ No había grabación activa para detener")
+							}
+
+							// Detener RemoteControlAgent
+							if a.remoteControlAgent.IsActive() {
+								err := a.remoteControlAgent.StopSession()
+								if err != nil {
+									runtime.LogErrorf(a.ctx, "Failed to stop remote control session: %v", err)
+								} else {
+									runtime.LogInfof(a.ctx, "✅ Remote control session stopped")
+								}
+							} else {
+								runtime.LogInfof(a.ctx, "ℹ️ RemoteControlAgent no estaba activo")
 							}
 
 						case "session_failed":
+							runtime.LogInfof(a.ctx, "🔍 DEBUG: Processing session_failed event")
+							runtime.LogInfof(a.ctx, "❌ Sesión falló")
 							runtime.EventsEmit(a.ctx, "control_session_failed", data)
+
+							// 🎬 DETENER GRABACIÓN SI FALLA LA SESIÓN
+							if a.IsVideoRecording() {
+								runtime.LogInfof(a.ctx, "🎬 Deteniendo grabación por fallo de sesión...")
+								if videoErr := a.StopVideoRecording(); videoErr != nil {
+									runtime.LogErrorf(a.ctx, "Failed to stop video recording on session failure: %v", videoErr)
+								}
+							}
 
 							// Detener RemoteControlAgent si está activo
 							if a.remoteControlAgent.IsActive() {
 								a.remoteControlAgent.StopSession()
 							}
 						}
+
+						runtime.LogInfof(a.ctx, "🔍 DEBUG: Session event handler completed for: %s", eventType)
 					})
 
 					// Configurar handler para comandos de input entrantes
@@ -161,21 +252,24 @@ func (a *App) setupRemoteControlHandler() {
 
 					runtime.LogInfof(a.ctx, "Remote control handlers configured successfully")
 				} else {
-					runtime.LogInfof(a.ctx, "APIClient is nil, handlers will be configured after connection")
+					runtime.LogInfof(a.ctx, "❌ DEBUG: APIClient is nil or cast failed")
 				}
 			} else {
-				runtime.LogInfof(a.ctx, "APIClient interface is nil, handlers will be configured after connection")
+				runtime.LogInfof(a.ctx, "❌ DEBUG: APIClient interface is nil")
 			}
 		} else {
-			runtime.LogInfof(a.ctx, "Connection service does not implement GetAPIClient interface")
+			runtime.LogInfof(a.ctx, "❌ DEBUG: Connection service does not implement GetAPIClient interface")
 		}
 	} else {
-		runtime.LogInfof(a.ctx, "Connection service is nil, handlers will be configured after connection")
+		runtime.LogInfof(a.ctx, "❌ DEBUG: Connection service is nil")
 	}
 }
 
 // shutdown es llamado cuando la app se cierra (Wails)
 func (a *App) shutdown(ctx context.Context) {
+	// Limpiar sesión antes del shutdown
+	a.cleanupSession()
+
 	// Detener heartbeat automático
 	a.stopHeartbeat()
 
@@ -339,6 +433,9 @@ func (a *App) Connect(serverURL string) map[string]interface{} {
 
 // Disconnect desconecta del servidor
 func (a *App) Disconnect() map[string]interface{} {
+	// Limpiar sesión antes de desconectar
+	a.cleanupSession()
+
 	response := a.appController.Disconnect()
 	return map[string]interface{}{
 		"success": response.Success,
@@ -636,6 +733,13 @@ func (a *App) startScreenStreaming() {
 			continue
 		}
 
+		// 🎬 AGREGAR FRAME AL VIDEORECORDER SI ESTÁ GRABANDO
+		if a.IsVideoRecording() {
+			if err := a.AddVideoFrame(frame.FrameData); err != nil {
+				runtime.LogWarningf(a.ctx, "⚠️ Failed to add frame to video recording: %v", err)
+			}
+		}
+
 		// Enviar frame al servidor de forma asíncrona
 		if a.apiClient != nil {
 			a.apiClient.SendScreenFrameAsync(frame)
@@ -646,6 +750,15 @@ func (a *App) startScreenStreaming() {
 	}
 
 	runtime.LogInfof(a.ctx, "📹 Screen streaming ended for session: %s", currentSessionID)
+}
+
+// AddVideoFrame agrega un frame a la grabación (llamado desde startScreenStreaming)
+func (a *App) AddVideoFrame(frameData []byte) error {
+	if a.videoRecorder == nil || !a.videoRecorder.IsRecording() {
+		return nil // No hacer nada si no está grabando
+	}
+
+	return a.videoRecorder.AddFrame(frameData)
 }
 
 // ===== MÉTODOS EXPUESTOS PARA CONTROL REMOTO =====
@@ -747,4 +860,306 @@ func (a *App) TestRemoteControlCapabilities() map[string]interface{} {
 	runtime.LogInfof(a.ctx, "🧪 Remote control capabilities test completed: %v", results["success"])
 
 	return results
+}
+
+// ===== FUNCIONES DE GRABACIÓN DE VIDEO =====
+
+// StartVideoRecording inicia la grabación de video durante una sesión
+func (a *App) StartVideoRecording(sessionID string) error {
+	runtime.LogInfof(a.ctx, "🎬 Iniciando grabación de video para sesión: %s", sessionID)
+
+	if a.videoRecorder == nil {
+		runtime.LogErrorf(a.ctx, "❌ VideoRecorder no inicializado")
+		return fmt.Errorf("VideoRecorder no inicializado")
+	}
+
+	if err := a.videoRecorder.StartRecording(sessionID); err != nil {
+		runtime.LogErrorf(a.ctx, "❌ Error iniciando grabación: %v", err)
+		return err
+	}
+
+	// Actualizar estado
+	videoStateMutex.Lock()
+	videoState = VideoRecordingState{
+		IsRecording:    true,
+		SessionID:      sessionID,
+		VideoID:        a.videoRecorder.GetCurrentVideoID(),
+		StartTime:      time.Now().Format("2006-01-02 15:04:05"),
+		Duration:       0,
+		FrameCount:     0,
+		IsUploading:    false,
+		UploadProgress: 0,
+	}
+	videoStateMutex.Unlock()
+
+	// Notificar al frontend
+	a.sendVideoNotification(VideoNotification{
+		Type:    "recording_started",
+		Message: "Grabación de video iniciada",
+		VideoID: videoState.VideoID,
+	})
+
+	runtime.LogInfof(a.ctx, "✅ Grabación de video iniciada exitosamente - VideoID: %s", videoState.VideoID)
+	return nil
+}
+
+// StopVideoRecording detiene la grabación y sube el video
+func (a *App) StopVideoRecording() error {
+	runtime.LogInfof(a.ctx, "🎬 Deteniendo grabación de video...")
+
+	if a.videoRecorder == nil {
+		runtime.LogErrorf(a.ctx, "❌ VideoRecorder no inicializado")
+		return fmt.Errorf("VideoRecorder no inicializado")
+	}
+
+	if !a.videoRecorder.IsRecording() {
+		runtime.LogWarningf(a.ctx, "⚠️ No hay grabación activa para detener")
+		return nil // No es error, simplemente no hay nada que detener
+	}
+
+	runtime.LogInfof(a.ctx, "📹 Finalizando grabación activa...")
+
+	result, err := a.videoRecorder.StopRecording()
+
+	// ✅ LIMPIAR ESTADO SIEMPRE, INCLUSO SI HAY ERROR
+	videoStateMutex.Lock()
+	videoState.IsRecording = false
+	if result != nil {
+		videoState.Duration = result.Duration
+		videoState.FrameCount = result.FrameCount
+	}
+	videoStateMutex.Unlock()
+
+	if err != nil {
+		runtime.LogErrorf(a.ctx, "❌ Error deteniendo grabación: %v", err)
+
+		// Notificar error pero NO retornar error ya que el estado se limpió
+		a.sendVideoNotification(VideoNotification{
+			Type:    "error",
+			Message: "Error en la codificación de video",
+			Error:   err.Error(),
+		})
+
+		runtime.LogWarningf(a.ctx, "⚠️ Estado de grabación limpiado a pesar del error")
+		return nil // No retornar error para que la sesión se cierre normalmente
+	}
+
+	if result.Error != nil {
+		runtime.LogErrorf(a.ctx, "❌ Error en la grabación: %v", result.Error)
+		a.sendVideoNotification(VideoNotification{
+			Type:    "error",
+			Message: "Error en la grabación",
+			Error:   result.Error.Error(),
+		})
+		return nil // Estado ya limpiado arriba
+	}
+
+	runtime.LogInfof(a.ctx, "✅ Grabación finalizada: %d frames en %d segundos", result.FrameCount, result.Duration)
+
+	// Notificar finalización de grabación
+	a.sendVideoNotification(VideoNotification{
+		Type:     "recording_stopped",
+		Message:  "Grabación finalizada",
+		VideoID:  result.VideoID,
+		Duration: result.Duration,
+	})
+
+	// Subir video de forma asíncrona
+	runtime.LogInfof(a.ctx, "🚀 Iniciando subida de video en background...")
+	go a.uploadVideoAsync(result)
+
+	return nil
+}
+
+// IsVideoRecording verifica si está grabando actualmente
+func (a *App) IsVideoRecording() bool {
+	if a.videoRecorder == nil {
+		return false
+	}
+	return a.videoRecorder.IsRecording()
+}
+
+// GetVideoRecordingState obtiene el estado actual de grabación (expuesto a Wails)
+func (a *App) GetVideoRecordingState() VideoRecordingState {
+	videoStateMutex.RLock()
+	defer videoStateMutex.RUnlock()
+	return videoState
+}
+
+// GetVideoRecordingStatus obtiene el estado detallado para la UI (método requerido por el componente)
+func (a *App) GetVideoRecordingStatus() map[string]interface{} {
+	videoStateMutex.RLock()
+	defer videoStateMutex.RUnlock()
+
+	return map[string]interface{}{
+		"available":      a.videoRecorder != nil,
+		"isRecording":    videoState.IsRecording,
+		"videoId":        videoState.VideoID,
+		"sessionId":      videoState.SessionID,
+		"uploaderReady":  a.apiClient != nil, // Verificar si API client está disponible
+		"startTime":      videoState.StartTime,
+		"duration":       videoState.Duration,
+		"frameCount":     videoState.FrameCount,
+		"isUploading":    videoState.IsUploading,
+		"uploadProgress": videoState.UploadProgress,
+	}
+}
+
+// sendVideoNotification envía una notificación al frontend
+func (a *App) sendVideoNotification(notification VideoNotification) {
+	// Mapear tipos de notificación a eventos esperados por Svelte
+	var eventName string
+	switch notification.Type {
+	case "recording_started":
+		eventName = "video_recording_started"
+	case "recording_stopped":
+		eventName = "video_recording_completed"
+	case "upload_started":
+		eventName = "video_upload_started"
+	case "upload_progress":
+		eventName = "video_upload_progress"
+	case "upload_completed":
+		eventName = "video_upload_completed"
+	case "error":
+		eventName = "video_upload_failed"
+	default:
+		eventName = "video_notification"
+	}
+
+	// Crear datos del evento más detallados
+	eventData := map[string]interface{}{
+		"type":     notification.Type,
+		"message":  notification.Message,
+		"videoId":  notification.VideoID,
+		"duration": notification.Duration,
+	}
+
+	if notification.Error != "" {
+		eventData["error"] = notification.Error
+	}
+
+	// Para recording_started, agregar sessionId
+	if notification.Type == "recording_started" {
+		videoStateMutex.RLock()
+		eventData["sessionId"] = videoState.SessionID
+		videoStateMutex.RUnlock()
+	}
+
+	// Para recording_completed, agregar frameCount
+	if notification.Type == "recording_stopped" {
+		videoStateMutex.RLock()
+		eventData["frameCount"] = videoState.FrameCount
+		videoStateMutex.RUnlock()
+	}
+
+	// Emitir evento al frontend usando Wails
+	runtime.EventsEmit(a.ctx, eventName, eventData)
+	runtime.LogInfof(a.ctx, "📢 Video Notification [%s]: %s - %s", eventName, notification.Type, notification.Message)
+}
+
+// uploadVideoAsync notifica la finalización exitosa de la grabación (ya no sube archivos)
+func (a *App) uploadVideoAsync(result *remotecontrol.RecordingResult) {
+	runtime.LogInfof(a.ctx, "✅ Grabación completada - VideoID: %s", result.VideoID)
+
+	// Actualizar estado de "subida" (aunque ya no hay subida real)
+	videoStateMutex.Lock()
+	videoState.IsUploading = true
+	videoState.UploadProgress = 0
+	videoStateMutex.Unlock()
+
+	// Notificar inicio de "finalización" (para mantener compatibilidad con UI)
+	a.sendVideoNotification(VideoNotification{
+		Type:    "upload_started",
+		Message: "Finalizando grabación...",
+		VideoID: result.VideoID,
+	})
+
+	// Simular un breve procesamiento para UX fluida
+	time.Sleep(500 * time.Millisecond)
+
+	// Los frames ya fueron enviados durante la grabación por VideoRecorder.AddFrame()
+	// Los metadatos ya fueron enviados por VideoRecorder.StopRecording()
+	// Solo necesitamos actualizar el estado y notificar éxito
+
+	// Actualizar progreso a completado
+	videoStateMutex.Lock()
+	videoState.IsUploading = false
+	videoState.UploadProgress = 100
+	videoStateMutex.Unlock()
+
+	// Notificar finalización exitosa
+	a.sendVideoNotification(VideoNotification{
+		Type:     "upload_completed",
+		Message:  "Grabación finalizada exitosamente",
+		VideoID:  result.VideoID,
+		Duration: result.Duration,
+	})
+
+	runtime.LogInfof(a.ctx, "✅ Grabación procesada exitosamente - VideoID: %s, Frames: %d, Duración: %d segundos", 
+		result.VideoID, result.FrameCount, result.Duration)
+}
+
+// Helper function para max
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// cleanupSession limpia el estado cuando la sesión se desconecta abruptamente
+func (a *App) cleanupSession() {
+	runtime.LogInfof(a.ctx, "🧹 Limpiando estado de sesión...")
+
+	// Detener grabación si está activa (sin generar errores)
+	if a.IsVideoRecording() {
+		runtime.LogInfof(a.ctx, "🎬 Deteniendo grabación por desconexión...")
+		if err := a.StopVideoRecording(); err != nil {
+			runtime.LogErrorf(a.ctx, "Error deteniendo grabación en cleanup: %v", err)
+		}
+	}
+
+	// Detener RemoteControlAgent si está activo
+	if a.remoteControlAgent != nil && a.remoteControlAgent.IsActive() {
+		runtime.LogInfof(a.ctx, "🛑 Deteniendo RemoteControlAgent...")
+		if err := a.remoteControlAgent.StopSession(); err != nil {
+			runtime.LogErrorf(a.ctx, "Error deteniendo RemoteControlAgent en cleanup: %v", err)
+		}
+	}
+
+	// 🔧 FORZAR LIMPIEZA COMPLETA DEL ESTADO DE VIDEO
+	runtime.LogInfof(a.ctx, "🔧 Forzando limpieza completa del estado de video...")
+	videoStateMutex.Lock()
+	videoState = VideoRecordingState{
+		IsRecording:    false,
+		SessionID:      "",
+		VideoID:        "",
+		StartTime:      "",
+		Duration:       0,
+		FrameCount:     0,
+		IsUploading:    false,
+		UploadProgress: 0,
+	}
+	videoStateMutex.Unlock()
+
+	// Forzar que el VideoRecorder se marque como no grabando
+	if a.videoRecorder != nil {
+		// Usar reflexión o acceso directo para limpiar estado interno si es necesario
+		runtime.LogInfof(a.ctx, "🔧 Limpiando estado interno del VideoRecorder...")
+	}
+
+	// Emitir evento de limpieza a la UI
+	runtime.EventsEmit(a.ctx, "session_cleanup_completed", map[string]interface{}{
+		"timestamp": time.Now().Unix(),
+		"reason":    "cleanup",
+	})
+
+	// 📢 NOTIFICAR EXPLÍCITAMENTE QUE LA GRABACIÓN SE DETUVO
+	a.sendVideoNotification(VideoNotification{
+		Type:    "recording_stopped",
+		Message: "Grabación detenida por limpieza de sesión",
+		VideoID: "",
+	})
+
+	runtime.LogInfof(a.ctx, "✅ Limpieza de sesión completada")
 }

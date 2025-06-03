@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -364,6 +365,8 @@ func (c *APIClient) readMessages() {
 
 // handleMessage procesa los mensajes recibidos
 func (c *APIClient) handleMessage(message WebSocketMessage) {
+	log.Printf("🔍 DEBUG: Received message type: %s", message.Type)
+
 	switch message.Type {
 	case MessageTypeClientAuthResp:
 		var response ClientAuthResponse
@@ -394,6 +397,7 @@ func (c *APIClient) handleMessage(message WebSocketMessage) {
 		log.Println("Heartbeat response received")
 
 	case MessageTypeRemoteControlRequest:
+		log.Printf("🔍 DEBUG: Processing remote control request")
 		// Manejar solicitud de control remoto
 		var request RemoteControlRequest
 		if data, err := json.Marshal(message.Data); err == nil {
@@ -417,6 +421,7 @@ func (c *APIClient) handleMessage(message WebSocketMessage) {
 		}
 
 	case MessageTypeSessionStarted:
+		log.Printf("🔍 DEBUG: Processing session started event")
 		log.Println("Remote control session started")
 		// Emitir evento para activar indicador UI
 		var sessionData map[string]interface{}
@@ -427,29 +432,33 @@ func (c *APIClient) handleMessage(message WebSocketMessage) {
 		// Crear handler que emita evento a través de callback
 		c.emitSessionEvent("session_started", sessionData)
 
-	case MessageTypeSessionEnded:
-		log.Println("Remote control session ended")
+	case MessageTypeSessionEnded, "control_session_ended":
+		log.Printf("🔍 DEBUG: Processing session ended event - type: %s", message.Type)
+		if message.Type == MessageTypeSessionEnded {
+			log.Println("Remote control session ended")
+		} else {
+			log.Println("Remote control session ended by admin")
+		}
+
+		log.Printf("🔍 DEBUG: Checking session event handler...")
+		c.mutex.RLock()
+		hasHandler := c.sessionEventHandler != nil
+		c.mutex.RUnlock()
+		log.Printf("🔍 DEBUG: Session event handler available: %v", hasHandler)
+
 		// Emitir evento para desactivar indicador UI
 		var sessionData map[string]interface{}
 		if data, err := json.Marshal(message.Data); err == nil {
 			json.Unmarshal(data, &sessionData)
+			log.Printf("🔍 DEBUG: Session data: %+v", sessionData)
 		}
 
 		// Crear handler que emita evento a través de callback
-		c.emitSessionEvent("session_ended", sessionData)
-
-	case "control_session_ended":
-		log.Println("Remote control session ended by admin")
-		// Emitir evento para desactivar indicador UI
-		var sessionData map[string]interface{}
-		if data, err := json.Marshal(message.Data); err == nil {
-			json.Unmarshal(data, &sessionData)
-		}
-
-		// Crear handler que emita evento a través de callback
+		log.Printf("🔍 DEBUG: Calling emitSessionEvent with 'session_ended'")
 		c.emitSessionEvent("session_ended", sessionData)
 
 	case MessageTypeSessionFailed:
+		log.Printf("🔍 DEBUG: Processing session failed event")
 		log.Println("Remote control session failed")
 		// Emitir evento para manejar fallo de sesión
 		var sessionData map[string]interface{}
@@ -461,6 +470,7 @@ func (c *APIClient) handleMessage(message WebSocketMessage) {
 		c.emitSessionEvent("session_failed", sessionData)
 
 	case MessageTypeInputCommand:
+		log.Printf("🔍 DEBUG: Processing input command")
 		// Manejar comando de input entrante
 		var command InputCommand
 		if data, err := json.Marshal(message.Data); err == nil {
@@ -483,8 +493,13 @@ func (c *APIClient) handleMessage(message WebSocketMessage) {
 			log.Printf("Failed to marshal input command data: %v", err)
 		}
 
+	case "video_recording_finalized":
+		log.Printf("🔍 DEBUG: Processing video recording finalized confirmation")
+		// Confirmación del backend de que la grabación fue procesada exitosamente
+		log.Println("✅ Video recording finalized confirmation received from backend")
+
 	default:
-		log.Printf("Unknown message type: %s", message.Type)
+		log.Printf("🔍 DEBUG: Unknown message type: %s", message.Type)
 	}
 }
 
@@ -553,13 +568,17 @@ func (c *APIClient) RejectRemoteControlSession(sessionID, reason string) error {
 
 // emitSessionEvent emite un evento a través de la función de callback
 func (c *APIClient) emitSessionEvent(eventType string, data interface{}) {
+	log.Printf("🔍 DEBUG: emitSessionEvent called with eventType: %s", eventType)
+
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()
 
 	if c.sessionEventHandler != nil {
+		log.Printf("🔍 DEBUG: Calling sessionEventHandler for event: %s", eventType)
 		c.sessionEventHandler(eventType, data)
+		log.Printf("🔍 DEBUG: sessionEventHandler call completed for event: %s", eventType)
 	} else {
-		log.Printf("No session event handler set for event: %s", eventType)
+		log.Printf("❌ DEBUG: No session event handler set for event: %s", eventType)
 	}
 }
 
@@ -577,17 +596,106 @@ func (c *APIClient) SendScreenFrame(frame ScreenFrame) error {
 	return c.sendMessage(message)
 }
 
-// SendScreenFrameAsync envía un frame de pantalla de forma asíncrona (no bloquea si hay error)
+// SendScreenFrameAsync envía un frame de pantalla de forma asíncrona
 func (c *APIClient) SendScreenFrameAsync(frame ScreenFrame) {
-	if !c.IsConnected() {
-		log.Printf("⚠️ Cannot send screen frame: not connected")
-		return
-	}
-
 	go func() {
-		err := c.SendScreenFrame(frame)
-		if err != nil {
-			log.Printf("❌ Error sending screen frame %d: %v", frame.SequenceNum, err)
+		if err := c.SendScreenFrame(frame); err != nil {
+			log.Printf("Error sending screen frame async: %v", err)
 		}
 	}()
+}
+
+// SendVideoChunk envía un chunk de video al servidor
+func (c *APIClient) SendVideoChunk(videoID, sessionID string, chunkNumber, totalChunks int, chunkData []byte) error {
+	// Codificar chunk data en base64
+	chunkDataB64 := base64.StdEncoding.EncodeToString(chunkData)
+
+	videoChunk := map[string]interface{}{
+		"video_id":      videoID,
+		"session_id":    sessionID,       // Usar session_id real pasado como parámetro
+		"chunk_index":   chunkNumber - 1, // Convertir a 0-based index
+		"chunk_data":    chunkDataB64,    // Base64 encoded
+		"is_last_chunk": chunkNumber == totalChunks,
+		"file_size":     int64(len(chunkData) * totalChunks), // Estimación
+		"duration":      60,                                  // Duración estimada en segundos
+		"file_name":     fmt.Sprintf("session_video_%s.mp4", videoID),
+		"timestamp":     time.Now().Unix(),
+	}
+
+	message := WebSocketMessage{
+		Type: "video_chunk_upload",
+		Data: videoChunk,
+	}
+
+	return c.sendMessage(message)
+}
+
+// SendVideoComplete envía señal de finalización del upload de video
+func (c *APIClient) SendVideoComplete(videoID string, duration, frameCount int) error {
+	finalizeData := map[string]interface{}{
+		"video_id":    videoID,
+		"duration":    duration,
+		"frame_count": frameCount,
+		"timestamp":   time.Now().Unix(),
+	}
+
+	message := WebSocketMessage{
+		Type: "video_upload_complete",
+		Data: finalizeData,
+	}
+
+	return c.sendMessage(message)
+}
+
+// SendVideoFrame envía un frame de video grabado al servidor
+func (c *APIClient) SendVideoFrame(frame interface{}) error {
+	videoFrame, ok := frame.(VideoFrameUpload)
+	if !ok {
+		return fmt.Errorf("SendVideoFrame: tipo de frame inválido")
+	}
+	if !c.IsConnected() {
+		return fmt.Errorf("not connected to server")
+	}
+
+	// Codificar frame data en base64
+	frameB64 := base64.StdEncoding.EncodeToString(videoFrame.FrameData)
+
+	msg := WebSocketMessage{
+		Type: MessageTypeVideoFrameUpload,
+		Data: map[string]interface{}{
+			"session_id":  videoFrame.SessionID,
+			"video_id":    videoFrame.VideoID,
+			"frame_index": videoFrame.FrameIndex,
+			"timestamp":   videoFrame.Timestamp,
+			"frame_data":  frameB64,
+		},
+	}
+
+	return c.sendMessage(msg)
+}
+
+// SendVideoRecordingComplete envía los metadatos de una grabación de video finalizada al servidor.
+func (c *APIClient) SendVideoRecordingComplete(videoID string, sessionID string, totalFrames int, fps float64, durationSeconds float64) error {
+	if !c.IsConnected() {
+		return fmt.Errorf("no conectado al servidor")
+	}
+
+	payload := VideoRecordingCompletePayload{
+		VideoID:         videoID,
+		SessionID:       sessionID,
+		TotalFrames:     totalFrames,
+		FPS:             fps,
+		DurationSeconds: durationSeconds,
+		Timestamp:       time.Now().Unix(),
+	}
+
+	message := WebSocketMessage{
+		Type: MessageTypeVideoRecordingComplete, // Nueva constante de tipo de mensaje
+		Data: payload,
+	}
+
+	log.Printf("🚀 Enviando metadatos de fin de grabación: VideoID=%s, SessionID=%s, Frames=%d, FPS=%.2f, Duración=%.2fs",
+		videoID, sessionID, totalFrames, fps, durationSeconds)
+
+	return c.sendMessage(message)
 }

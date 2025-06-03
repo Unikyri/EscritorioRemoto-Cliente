@@ -33,6 +33,12 @@ const (
 	MessageTypeSessionStarted       = "session_started"
 	MessageTypeSessionEnded         = "session_ended"
 	MessageTypeSessionFailed        = "session_failed"
+
+	// Screen Streaming Messages
+	MessageTypeScreenFrame            = "screen_frame"
+	MessageTypeInputCommand           = "input_command"
+	MessageTypeVideoFrameUpload       = "video_frame_upload"
+	MessageTypeVideoRecordingComplete = "video_recording_complete"
 )
 
 // Base message structure
@@ -93,11 +99,6 @@ type SessionRejectedMessage struct {
 	Reason    string `json:"reason,omitempty"`
 }
 
-// Screen Streaming Messages
-const (
-	MessageTypeScreenFrame  = "screen_frame"
-	MessageTypeInputCommand = "input_command"
-)
 
 // ScreenFrame represents a captured screen frame
 type ScreenFrame struct {
@@ -134,4 +135,23 @@ type KeyboardEventPayload struct {
 	Code      string   `json:"code,omitempty"`      // Physical key code
 	Text      string   `json:"text,omitempty"`      // For typing text
 	Modifiers []string `json:"modifiers,omitempty"` // ["ctrl", "alt", "shift", "meta"]
+}
+
+// VideoFrameUpload representa un frame de video individual para subir
+type VideoFrameUpload struct {
+	SessionID  string `json:"session_id"`
+	VideoID    string `json:"video_id"`
+	FrameIndex int    `json:"frame_index"`
+	Timestamp  int64  `json:"timestamp"`
+	FrameData  []byte `json:"frame_data"` // Base64 encoded JPEG data
+}
+
+// VideoRecordingCompletePayload contiene los metadatos de una grabación finalizada
+type VideoRecordingCompletePayload struct {
+	VideoID         string  `json:"video_id"`
+	SessionID       string  `json:"session_id"`
+	TotalFrames     int     `json:"total_frames"`
+	FPS             float64 `json:"fps"`
+	DurationSeconds float64 `json:"duration_seconds"`
+	Timestamp       int64   `json:"timestamp"`
 }

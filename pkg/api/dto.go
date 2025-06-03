@@ -25,7 +25,7 @@ const (
 	MessageTypePCRegistrationResp = "PC_REGISTRATION_RESPONSE"
 	MessageTypeHeartbeat          = "HEARTBEAT"
 	MessageTypeHeartbeatResp      = "HEARTBEAT_RESPONSE"
-	
+
 	// Remote Control Messages
 	MessageTypeRemoteControlRequest = "remote_control_request"
 	MessageTypeSessionAccepted      = "session_accepted"
@@ -91,4 +91,47 @@ type SessionAcceptedMessage struct {
 type SessionRejectedMessage struct {
 	SessionID string `json:"session_id"`
 	Reason    string `json:"reason,omitempty"`
+}
+
+// Screen Streaming Messages
+const (
+	MessageTypeScreenFrame  = "screen_frame"
+	MessageTypeInputCommand = "input_command"
+)
+
+// ScreenFrame represents a captured screen frame
+type ScreenFrame struct {
+	SessionID   string `json:"session_id"`
+	Timestamp   int64  `json:"timestamp"`
+	Width       int    `json:"width"`
+	Height      int    `json:"height"`
+	Format      string `json:"format"`            // "jpeg", "png", etc.
+	Quality     int    `json:"quality,omitempty"` // For JPEG compression (1-100)
+	FrameData   []byte `json:"frame_data"`        // Base64 encoded image data
+	SequenceNum int64  `json:"sequence_num"`
+}
+
+// InputCommand represents a remote input command (mouse/keyboard)
+type InputCommand struct {
+	SessionID string                 `json:"session_id"`
+	Timestamp int64                  `json:"timestamp"`
+	EventType string                 `json:"event_type"` // "mouse", "keyboard"
+	Action    string                 `json:"action"`     // "move", "click", "scroll", "keydown", "keyup", "type"
+	Payload   map[string]interface{} `json:"payload"`    // Event-specific data
+}
+
+// Mouse Event Payload Fields
+type MouseEventPayload struct {
+	X      int    `json:"x"`
+	Y      int    `json:"y"`
+	Button string `json:"button,omitempty"` // "left", "right", "middle"
+	Delta  int    `json:"delta,omitempty"`  // For scroll events
+}
+
+// Keyboard Event Payload Fields
+type KeyboardEventPayload struct {
+	Key       string   `json:"key"`                 // Key identifier
+	Code      string   `json:"code,omitempty"`      // Physical key code
+	Text      string   `json:"text,omitempty"`      // For typing text
+	Modifiers []string `json:"modifiers,omitempty"` // ["ctrl", "alt", "shift", "meta"]
 }

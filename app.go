@@ -9,6 +9,7 @@ import (
 	"EscritorioRemoto-Cliente/internal/infrastructure/patterns/observer"
 	"EscritorioRemoto-Cliente/internal/infrastructure/patterns/singleton"
 	"EscritorioRemoto-Cliente/pkg/api"
+	"EscritorioRemoto-Cliente/pkg/remotecontrol"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
@@ -24,6 +25,9 @@ type App struct {
 
 	// API Client para control remoto
 	apiClient *api.APIClient
+
+	// RemoteControlAgent para captura de pantalla y control de input
+	remoteControlAgent *remotecontrol.RemoteControlAgent
 
 	// Timer para heartbeat automático
 	heartbeatTicker *time.Ticker
@@ -49,9 +53,10 @@ func NewApp() *App {
 	)
 
 	return &App{
-		appController: appController,
-		eventManager:  eventManager,
-		configManager: configManager,
+		appController:      appController,
+		eventManager:       eventManager,
+		configManager:      configManager,
+		remoteControlAgent: remotecontrol.NewRemoteControlAgent(),
 	}
 }
 
@@ -98,18 +103,74 @@ func (a *App) setupRemoteControlHandler() {
 						runtime.LogInfof(a.ctx, "Remote control request received from admin: %s", request.AdminUsername)
 					})
 
-					runtime.LogInfof(a.ctx, "Remote control handler configured successfully")
+					// Configurar handler para eventos de sesión
+					apiClient.SetSessionEventHandler(func(eventType string, data interface{}) {
+						runtime.LogInfof(a.ctx, "Session event received: %s", eventType)
+
+						switch eventType {
+						case "session_started":
+							runtime.EventsEmit(a.ctx, "control_session_started", data)
+
+							// Extraer sessionID del data
+							if sessionData, ok := data.(map[string]interface{}); ok {
+								if sessionID, ok := sessionData["session_id"].(string); ok {
+									// Iniciar RemoteControlAgent
+									err := a.remoteControlAgent.StartSession(sessionID)
+									if err != nil {
+										runtime.LogErrorf(a.ctx, "Failed to start remote control session: %v", err)
+									} else {
+										runtime.LogInfof(a.ctx, "Remote control session started: %s", sessionID)
+										// Iniciar goroutine para enviar frames
+										go a.startScreenStreaming()
+									}
+								}
+							}
+
+						case "session_ended":
+							runtime.EventsEmit(a.ctx, "control_session_ended", data)
+
+							// Detener RemoteControlAgent
+							err := a.remoteControlAgent.StopSession()
+							if err != nil {
+								runtime.LogErrorf(a.ctx, "Failed to stop remote control session: %v", err)
+							} else {
+								runtime.LogInfof(a.ctx, "Remote control session stopped")
+							}
+
+						case "session_failed":
+							runtime.EventsEmit(a.ctx, "control_session_failed", data)
+
+							// Detener RemoteControlAgent si está activo
+							if a.remoteControlAgent.IsActive() {
+								a.remoteControlAgent.StopSession()
+							}
+						}
+					})
+
+					// Configurar handler para comandos de input entrantes
+					apiClient.SetInputCommandHandler(func(command api.InputCommand) {
+						runtime.LogInfof(a.ctx, "Input command received: type=%s, action=%s",
+							command.EventType, command.Action)
+
+						// Procesar comando a través del RemoteControlAgent
+						err := a.remoteControlAgent.ProcessInputCommand(command)
+						if err != nil {
+							runtime.LogErrorf(a.ctx, "Failed to process input command: %v", err)
+						}
+					})
+
+					runtime.LogInfof(a.ctx, "Remote control handlers configured successfully")
 				} else {
-					runtime.LogInfof(a.ctx, "APIClient is nil, remote control handler will be configured after connection")
+					runtime.LogInfof(a.ctx, "APIClient is nil, handlers will be configured after connection")
 				}
 			} else {
-				runtime.LogInfof(a.ctx, "APIClient interface is nil, remote control handler will be configured after connection")
+				runtime.LogInfof(a.ctx, "APIClient interface is nil, handlers will be configured after connection")
 			}
 		} else {
 			runtime.LogInfof(a.ctx, "Connection service does not implement GetAPIClient interface")
 		}
 	} else {
-		runtime.LogInfof(a.ctx, "Connection service is nil, remote control handler will be configured after connection")
+		runtime.LogInfof(a.ctx, "Connection service is nil, handlers will be configured after connection")
 	}
 }
 
@@ -538,4 +599,152 @@ func (w *WailsUIObserver) OnEvent(event observer.Event) error {
 // GetID implementa Observer.GetID
 func (w *WailsUIObserver) GetID() string {
 	return "wails_ui_observer"
+}
+
+// ===== STREAMING DE PANTALLA =====
+
+// startScreenStreaming inicia el streaming de pantalla durante una sesión activa
+func (a *App) startScreenStreaming() {
+	runtime.LogInfof(a.ctx, "📹 Starting screen streaming...")
+
+	// Obtener canal de frames del RemoteControlAgent
+	frameOutput := a.remoteControlAgent.GetFrameOutput()
+
+	// Obtener el sessionID actual al inicio del streaming
+	currentSessionID := a.remoteControlAgent.GetActiveSessionID()
+	runtime.LogInfof(a.ctx, "📹 Screen streaming for session: %s", currentSessionID)
+
+	for frame := range frameOutput {
+		// Verificar si la sesión sigue activa Y es la misma sesión
+		if !a.remoteControlAgent.IsActive() {
+			runtime.LogInfof(a.ctx, "🔚 Screen streaming stopped - session no longer active")
+			break
+		}
+
+		// Verificar que el frame pertenece a la sesión actual
+		if frame.SessionID != currentSessionID {
+			runtime.LogWarningf(a.ctx, "⚠️ Dropping frame for old session %s (current: %s)",
+				frame.SessionID, currentSessionID)
+			continue
+		}
+
+		// Verificar que aún coincide con la sesión activa del agente
+		activeSessionID := a.remoteControlAgent.GetActiveSessionID()
+		if frame.SessionID != activeSessionID {
+			runtime.LogWarningf(a.ctx, "⚠️ Dropping frame for mismatched session %s (active: %s)",
+				frame.SessionID, activeSessionID)
+			continue
+		}
+
+		// Enviar frame al servidor de forma asíncrona
+		if a.apiClient != nil {
+			a.apiClient.SendScreenFrameAsync(frame)
+		} else {
+			runtime.LogWarningf(a.ctx, "⚠️ Cannot send screen frame: API client is nil")
+			break
+		}
+	}
+
+	runtime.LogInfof(a.ctx, "📹 Screen streaming ended for session: %s", currentSessionID)
+}
+
+// ===== MÉTODOS EXPUESTOS PARA CONTROL REMOTO =====
+
+// GetRemoteControlStatus obtiene el estado del control remoto
+func (a *App) GetRemoteControlStatus() map[string]interface{} {
+	if a.remoteControlAgent == nil {
+		return map[string]interface{}{
+			"active":     false,
+			"session_id": "",
+			"error":      "Remote control agent not initialized",
+		}
+	}
+
+	return map[string]interface{}{
+		"active":       a.remoteControlAgent.IsActive(),
+		"session_id":   a.remoteControlAgent.GetActiveSessionID(),
+		"capabilities": a.remoteControlAgent.GetCapabilities(),
+	}
+}
+
+// SetRemoteControlSettings configura los ajustes del control remoto
+func (a *App) SetRemoteControlSettings(fps int, quality int) map[string]interface{} {
+	if a.remoteControlAgent == nil {
+		return map[string]interface{}{
+			"success": false,
+			"error":   "Remote control agent not initialized",
+		}
+	}
+
+	// Configurar FPS
+	if fps > 0 {
+		a.remoteControlAgent.SetFrameRate(fps)
+	}
+
+	// Configurar calidad JPEG
+	if quality > 0 {
+		a.remoteControlAgent.SetJPEGQuality(quality)
+	}
+
+	runtime.LogInfof(a.ctx, "🎛️ Remote control settings updated: FPS=%d, Quality=%d", fps, quality)
+
+	return map[string]interface{}{
+		"success": true,
+		"message": "Settings updated successfully",
+		"settings": map[string]interface{}{
+			"fps":     fps,
+			"quality": quality,
+		},
+	}
+}
+
+// TestRemoteControlCapabilities realiza pruebas de las capacidades del control remoto
+func (a *App) TestRemoteControlCapabilities() map[string]interface{} {
+	if a.remoteControlAgent == nil {
+		return map[string]interface{}{
+			"success": false,
+			"error":   "Remote control agent not initialized",
+		}
+	}
+
+	runtime.LogInfof(a.ctx, "🧪 Testing remote control capabilities...")
+
+	results := map[string]interface{}{
+		"success": true,
+		"tests":   map[string]interface{}{},
+	}
+
+	// Test screen capture
+	err := a.remoteControlAgent.TestScreenCapture()
+	if err != nil {
+		results["tests"].(map[string]interface{})["screen_capture"] = map[string]interface{}{
+			"success": false,
+			"error":   err.Error(),
+		}
+		results["success"] = false
+	} else {
+		results["tests"].(map[string]interface{})["screen_capture"] = map[string]interface{}{
+			"success": true,
+			"message": "Screen capture test passed",
+		}
+	}
+
+	// Test input simulation
+	err = a.remoteControlAgent.TestInputSimulation()
+	if err != nil {
+		results["tests"].(map[string]interface{})["input_simulation"] = map[string]interface{}{
+			"success": false,
+			"error":   err.Error(),
+		}
+		results["success"] = false
+	} else {
+		results["tests"].(map[string]interface{})["input_simulation"] = map[string]interface{}{
+			"success": true,
+			"message": "Input simulation test passed",
+		}
+	}
+
+	runtime.LogInfof(a.ctx, "🧪 Remote control capabilities test completed: %v", results["success"])
+
+	return results
 }

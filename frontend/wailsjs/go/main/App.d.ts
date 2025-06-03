@@ -13,6 +13,8 @@ export function GetConnectionStatus():Promise<Record<string, any>>;
 
 export function GetPCInfo():Promise<Record<string, any>>;
 
+export function GetRemoteControlStatus():Promise<Record<string, any>>;
+
 export function GetSystemInfo():Promise<Record<string, any>>;
 
 export function IsAuthenticated():Promise<boolean>;
@@ -24,3 +26,7 @@ export function Logout():Promise<Record<string, any>>;
 export function RegisterPC():Promise<Record<string, any>>;
 
 export function RejectControlRequest(arg1:string,arg2:string):Promise<Record<string, any>>;
+
+export function SetRemoteControlSettings(arg1:number,arg2:number):Promise<Record<string, any>>;
+
+export function TestRemoteControlCapabilities():Promise<Record<string, any>>;

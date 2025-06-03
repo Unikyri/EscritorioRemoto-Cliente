@@ -26,9 +26,13 @@
   // Estado de sesión de control remoto
   let remoteControlActive = false;
   let activeSessionId = '';
+  let activeSessionAdmin = '';
 
   // Suscribirse a cambios de estado
   $: currentView = $appState.currentView;
+
+  // Configurar event listeners inmediatamente (ANTES del onMount)
+  setupRemoteControlListeners();
 
   onMount(async () => {
     // Verificar si hay una sesión existente
@@ -41,15 +45,14 @@
       loading = false;
       setLoading(false);
     }
-
-    // Configurar event listeners para control remoto
-    setupRemoteControlListeners();
   });
 
   function setupRemoteControlListeners() {
+    console.log('🎧 Setting up remote control event listeners...');
+    
     // Escuchar solicitudes de control remoto entrantes
     EventsOn('incoming_control_request', (data) => {
-      console.log('Incoming control request:', data);
+      console.log('🎮 Incoming control request:', data);
       remoteControlRequest = {
         sessionId: data.sessionId || '',
         adminUsername: data.adminUsername || 'Administrador',
@@ -61,26 +64,49 @@
 
     // Escuchar cuando se acepta una sesión
     EventsOn('control_session_accepted', (data) => {
-      console.log('Control session accepted:', data);
+      console.log('✅ Control session accepted:', data);
       remoteControlActive = true;
       activeSessionId = data.sessionId || '';
+      activeSessionAdmin = data.adminUsername || remoteControlRequest.adminUsername || 'Administrador';
       showRemoteControlDialog = false;
     });
 
     // Escuchar cuando se rechaza una sesión
     EventsOn('control_session_rejected', (data) => {
-      console.log('Control session rejected:', data);
+      console.log('❌ Control session rejected:', data);
       showRemoteControlDialog = false;
       remoteControlActive = false;
       activeSessionId = '';
+      activeSessionAdmin = '';
     });
 
-    // Escuchar cuando termina una sesión
+    // Escuchar cuando una sesión inicia efectivamente (backend confirmation)
+    EventsOn('control_session_started', (data) => {
+      console.log('🚀 Control session started by backend:', data);
+      remoteControlActive = true;
+      if (data && data.sessionId) {
+        activeSessionId = data.sessionId;
+      }
+    });
+
+    // Escuchar cuando termina una sesión (backend notification)
     EventsOn('control_session_ended', (data) => {
-      console.log('Control session ended:', data);
+      console.log('🔚 Control session ended by backend:', data);
       remoteControlActive = false;
       activeSessionId = '';
+      activeSessionAdmin = '';
     });
+
+    // Escuchar cuando falla una sesión
+    EventsOn('control_session_failed', (data) => {
+      console.log('❌ Control session failed:', data);
+      remoteControlActive = false;
+      activeSessionId = '';
+      activeSessionAdmin = '';
+      showRemoteControlDialog = false;
+    });
+    
+    console.log('✅ Remote control event listeners configured');
   }
 
   function handleRemoteControlAccepted(event) {
@@ -93,39 +119,57 @@
     console.log('Remote control rejected:', event.detail);
     showRemoteControlDialog = false;
   }
+
+  function handleAuthenticated() {
+    console.log('User authenticated, switching to dashboard');
+    // Esta función será llamada cuando el login sea exitoso
+  }
 </script>
 
 <main>
   {#if loading}
-    <div class="loading-container">
-      <div class="loading-spinner"></div>
-      <p>Cargando...</p>
+    <div class="loading-screen">
+      <div class="loading-content">
+        <div class="loading-logo">🖥️</div>
+        <h2>RemoteDesk Cliente</h2>
+        <div class="loading-spinner"></div>
+        <p>Iniciando aplicación...</p>
+      </div>
     </div>
   {:else if currentView === 'login'}
-    <LoginView />
+    <LoginView on:authenticated={handleAuthenticated} />
   {:else if currentView === 'dashboard'}
     <MainDashboardView />
   {/if}
 
-  <!-- Indicador de sesión de control remoto activa -->
+  <!-- Notificación de Sesión Activa -->
   {#if remoteControlActive}
-    <div class="remote-control-indicator">
-      <div class="indicator-content">
-        <span class="indicator-icon">🖥️</span>
-        <span class="indicator-text">Sesión de control remoto activa</span>
-        <div class="indicator-pulse"></div>
+    <div class="session-notification" class:active={remoteControlActive}>
+      <div class="notification-content">
+        <div class="notification-icon">🎮</div>
+        <div class="notification-text">
+          <h4>Sesión Remota Activa</h4>
+          <p>Administrador: <strong>{activeSessionAdmin}</strong></p>
+          <small>Sesión: {activeSessionId.substring(0, 8)}...</small>
+        </div>
+        <div class="notification-status">
+          <div class="status-pulse"></div>
+          <span>En curso</span>
+        </div>
       </div>
     </div>
   {/if}
 
-  <!-- Diálogo de solicitud de control remoto -->
-  <RemoteControlDialog
-    bind:visible={showRemoteControlDialog}
-    adminUsername={remoteControlRequest.adminUsername}
-    sessionId={remoteControlRequest.sessionId}
-    on:accepted={handleRemoteControlAccepted}
-    on:rejected={handleRemoteControlRejected}
-  />
+  <!-- Diálogo de Control Remoto -->
+  {#if showRemoteControlDialog}
+    <RemoteControlDialog
+      visible={showRemoteControlDialog}
+      adminUsername={remoteControlRequest.adminUsername}
+      sessionId={remoteControlRequest.sessionId}
+      on:accepted={handleRemoteControlAccepted}
+      on:rejected={handleRemoteControlRejected}
+    />
+  {/if}
 </main>
 
 <style>
@@ -150,7 +194,7 @@
     position: relative;
   }
 
-  .loading-container {
+  .loading-screen {
     display: flex;
     flex-direction: column;
     justify-content: center;
@@ -160,6 +204,15 @@
     color: white;
   }
 
+  .loading-content {
+    text-align: center;
+  }
+
+  .loading-logo {
+    font-size: 48px;
+    margin-bottom: 20px;
+  }
+
   .loading-spinner {
     width: 40px;
     height: 40px;
@@ -167,7 +220,7 @@
     border-top: 4px solid white;
     border-radius: 50%;
     animation: spin 1s linear infinite;
-    margin-bottom: 20px;
+    margin: 0 auto 20px;
   }
 
   .loading-container p {
@@ -181,52 +234,95 @@
     }
   }
 
-  /* Indicador de sesión de control remoto */
-  .remote-control-indicator {
+  /* Notificación de Sesión Activa */
+  .session-notification {
     position: fixed;
     top: 20px;
     right: 20px;
-    z-index: 999;
-    background: linear-gradient(135deg, #ff6b6b 0%, #ee5a24 100%);
+    background: linear-gradient(135deg, #10b981 0%, #059669 100%);
     color: white;
-    padding: 12px 20px;
-    border-radius: 25px;
-    box-shadow: 0 4px 15px rgba(255, 107, 107, 0.3);
-    animation: slideInRight 0.3s ease-out;
+    padding: 16px 20px;
+    border-radius: 12px;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    box-shadow: 0 8px 25px rgba(16, 185, 129, 0.3);
+    backdrop-filter: blur(10px);
+    z-index: 1000;
+    min-width: 280px;
+    max-width: 350px;
+    animation: slideInRight 0.4s ease-out;
+    transition: all 0.3s ease;
   }
 
-  .indicator-content {
+  .session-notification.active {
+    transform: translateX(0);
+    opacity: 1;
+  }
+
+  .notification-content {
     display: flex;
-    align-items: center;
-    gap: 8px;
-    position: relative;
+    align-items: flex-start;
+    gap: 12px;
   }
 
-  .indicator-icon {
-    font-size: 16px;
+  .notification-icon {
+    font-size: 20px;
+    margin-top: 2px;
   }
 
-  .indicator-text {
+  .notification-text {
+    flex: 1;
+  }
+
+  .notification-text h4 {
+    margin: 0 0 4px 0;
     font-size: 14px;
     font-weight: 600;
+    color: white;
   }
 
-  .indicator-pulse {
+  .notification-text p {
+    margin: 0 0 4px 0;
+    font-size: 12px;
+    color: rgba(255, 255, 255, 0.9);
+  }
+
+  .notification-text small {
+    font-size: 10px;
+    color: rgba(255, 255, 255, 0.7);
+    font-family: monospace;
+  }
+
+  .notification-status {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 2px;
+  }
+
+  .notification-status span {
+    font-size: 11px;
+    font-weight: 600;
+    color: rgba(255, 255, 255, 0.9);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  .status-pulse {
     width: 8px;
     height: 8px;
-    background: white;
+    background: rgba(255, 255, 255, 0.9);
     border-radius: 50%;
     animation: pulse 2s infinite;
   }
 
   @keyframes slideInRight {
     from {
-      opacity: 0;
       transform: translateX(100%);
+      opacity: 0;
     }
     to {
-      opacity: 1;
       transform: translateX(0);
+      opacity: 1;
     }
   }
 
@@ -236,7 +332,7 @@
       transform: scale(1);
     }
     50% {
-      opacity: 0.5;
+      opacity: 0.6;
       transform: scale(1.2);
     }
   }

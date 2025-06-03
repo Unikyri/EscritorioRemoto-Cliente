@@ -26,6 +26,10 @@ export function GetPCInfo() {
   return window['go']['main']['App']['GetPCInfo']();
 }
 
+export function GetRemoteControlStatus() {
+  return window['go']['main']['App']['GetRemoteControlStatus']();
+}
+
 export function GetSystemInfo() {
   return window['go']['main']['App']['GetSystemInfo']();
 }
@@ -48,4 +52,12 @@ export function RegisterPC() {
 
 export function RejectControlRequest(arg1, arg2) {
   return window['go']['main']['App']['RejectControlRequest'](arg1, arg2);
+}
+
+export function SetRemoteControlSettings(arg1, arg2) {
+  return window['go']['main']['App']['SetRemoteControlSettings'](arg1, arg2);
+}
+
+export function TestRemoteControlCapabilities() {
+  return window['go']['main']['App']['TestRemoteControlCapabilities']();
 }

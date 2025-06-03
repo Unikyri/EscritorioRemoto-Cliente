@@ -14,12 +14,19 @@ import (
 // RemoteControlRequestHandler es el callback para manejar solicitudes de control remoto
 type RemoteControlRequestHandler func(request RemoteControlRequest)
 
+// SessionEventHandler es el callback para manejar eventos de sesión
+type SessionEventHandler func(eventType string, data interface{})
+
+// InputCommandHandler es el callback para manejar comandos de input entrantes
+type InputCommandHandler func(command InputCommand)
+
 // APIClient maneja la comunicación WebSocket con el servidor
 type APIClient struct {
 	serverURL   string
 	conn        *websocket.Conn
 	isConnected bool
 	mutex       sync.RWMutex
+	writeMutex  sync.Mutex // Mutex dedicado para escrituras al WebSocket
 
 	// Channels para manejar respuestas
 	authResponse chan ClientAuthResponse
@@ -27,6 +34,12 @@ type APIClient struct {
 
 	// Handler para solicitudes de control remoto
 	remoteControlHandler RemoteControlRequestHandler
+
+	// Handler para eventos de sesión
+	sessionEventHandler SessionEventHandler
+
+	// Handler para comandos de input entrantes
+	inputCommandHandler InputCommandHandler
 
 	// Configuración
 	connectTimeout time.Duration
@@ -51,6 +64,20 @@ func (c *APIClient) SetRemoteControlHandler(handler RemoteControlRequestHandler)
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 	c.remoteControlHandler = handler
+}
+
+// SetSessionEventHandler establece el handler para eventos de sesión
+func (c *APIClient) SetSessionEventHandler(handler SessionEventHandler) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	c.sessionEventHandler = handler
+}
+
+// SetInputCommandHandler establece el handler para comandos de input entrantes
+func (c *APIClient) SetInputCommandHandler(handler InputCommandHandler) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	c.inputCommandHandler = handler
 }
 
 // Connect establece la conexión WebSocket con el servidor
@@ -111,8 +138,11 @@ func (c *APIClient) Disconnect() error {
 		return nil
 	}
 
-	// Enviar mensaje de cierre
+	// Enviar mensaje de cierre usando mutex de escritura
+	c.writeMutex.Lock()
 	err := c.conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+	c.writeMutex.Unlock()
+
 	if err != nil {
 		log.Printf("Error sending close message: %v", err)
 	}
@@ -241,17 +271,23 @@ func (c *APIClient) SendHeartbeat() error {
 
 // sendMessage envía un mensaje WebSocket
 func (c *APIClient) sendMessage(message WebSocketMessage) error {
+	// Usar mutex de lectura para verificar estado
 	c.mutex.RLock()
-	defer c.mutex.RUnlock()
-
 	if !c.isConnected || c.conn == nil {
+		c.mutex.RUnlock()
 		return fmt.Errorf("not connected")
 	}
+	conn := c.conn
+	c.mutex.RUnlock()
+
+	// Usar mutex de escritura para operaciones de escritura
+	c.writeMutex.Lock()
+	defer c.writeMutex.Unlock()
 
 	// Establecer timeout de escritura
-	c.conn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
+	conn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
 
-	return c.conn.WriteJSON(message)
+	return conn.WriteJSON(message)
 }
 
 // readMessages lee mensajes del WebSocket en un goroutine
@@ -270,6 +306,11 @@ func (c *APIClient) readMessages() {
 	// Configurar ping handler para mantener conexión viva
 	c.conn.SetPingHandler(func(appData string) error {
 		log.Println("Received ping, sending pong")
+
+		// Usar mutex de escritura para la respuesta pong
+		c.writeMutex.Lock()
+		defer c.writeMutex.Unlock()
+
 		return c.conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(10*time.Second))
 	})
 
@@ -377,15 +418,70 @@ func (c *APIClient) handleMessage(message WebSocketMessage) {
 
 	case MessageTypeSessionStarted:
 		log.Println("Remote control session started")
-		// TODO: Implementar lógica para sesión iniciada
+		// Emitir evento para activar indicador UI
+		var sessionData map[string]interface{}
+		if data, err := json.Marshal(message.Data); err == nil {
+			json.Unmarshal(data, &sessionData)
+		}
+
+		// Crear handler que emita evento a través de callback
+		c.emitSessionEvent("session_started", sessionData)
 
 	case MessageTypeSessionEnded:
 		log.Println("Remote control session ended")
-		// TODO: Implementar lógica para sesión terminada
+		// Emitir evento para desactivar indicador UI
+		var sessionData map[string]interface{}
+		if data, err := json.Marshal(message.Data); err == nil {
+			json.Unmarshal(data, &sessionData)
+		}
+
+		// Crear handler que emita evento a través de callback
+		c.emitSessionEvent("session_ended", sessionData)
+
+	case "control_session_ended":
+		log.Println("Remote control session ended by admin")
+		// Emitir evento para desactivar indicador UI
+		var sessionData map[string]interface{}
+		if data, err := json.Marshal(message.Data); err == nil {
+			json.Unmarshal(data, &sessionData)
+		}
+
+		// Crear handler que emita evento a través de callback
+		c.emitSessionEvent("session_ended", sessionData)
 
 	case MessageTypeSessionFailed:
 		log.Println("Remote control session failed")
-		// TODO: Implementar lógica para sesión fallida
+		// Emitir evento para manejar fallo de sesión
+		var sessionData map[string]interface{}
+		if data, err := json.Marshal(message.Data); err == nil {
+			json.Unmarshal(data, &sessionData)
+		}
+
+		// Crear handler que emita evento a través de callback
+		c.emitSessionEvent("session_failed", sessionData)
+
+	case MessageTypeInputCommand:
+		// Manejar comando de input entrante
+		var command InputCommand
+		if data, err := json.Marshal(message.Data); err == nil {
+			if err := json.Unmarshal(data, &command); err == nil {
+				c.mutex.RLock()
+				handler := c.inputCommandHandler
+				c.mutex.RUnlock()
+
+				if handler != nil {
+					log.Printf("🎮 Received input command: type=%s, action=%s",
+						command.EventType, command.Action)
+					handler(command)
+				} else {
+					log.Println("Received input command but no handler set")
+				}
+			} else {
+				log.Printf("Failed to unmarshal input command: %v", err)
+			}
+		} else {
+			log.Printf("Failed to marshal input command data: %v", err)
+		}
 
 	default:
 		log.Printf("Unknown message type: %s", message.Type)
@@ -408,8 +504,11 @@ func (c *APIClient) startKeepAlive() {
 			break
 		}
 
-		// Enviar ping
+		// Usar mutex de escritura para enviar ping
+		c.writeMutex.Lock()
 		err := conn.WriteControl(websocket.PingMessage, []byte("ping"), time.Now().Add(10*time.Second))
+		c.writeMutex.Unlock()
+
 		if err != nil {
 			log.Printf("Failed to send ping: %v", err)
 			// No cerrar conexión por error de ping, solo logear
@@ -450,4 +549,45 @@ func (c *APIClient) RejectRemoteControlSession(sessionID, reason string) error {
 	}
 
 	return c.sendMessage(message)
+}
+
+// emitSessionEvent emite un evento a través de la función de callback
+func (c *APIClient) emitSessionEvent(eventType string, data interface{}) {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
+	if c.sessionEventHandler != nil {
+		c.sessionEventHandler(eventType, data)
+	} else {
+		log.Printf("No session event handler set for event: %s", eventType)
+	}
+}
+
+// SendScreenFrame envía un frame de pantalla al servidor
+func (c *APIClient) SendScreenFrame(frame ScreenFrame) error {
+	if !c.IsConnected() {
+		return fmt.Errorf("not connected to server")
+	}
+
+	message := WebSocketMessage{
+		Type: MessageTypeScreenFrame,
+		Data: frame,
+	}
+
+	return c.sendMessage(message)
+}
+
+// SendScreenFrameAsync envía un frame de pantalla de forma asíncrona (no bloquea si hay error)
+func (c *APIClient) SendScreenFrameAsync(frame ScreenFrame) {
+	if !c.IsConnected() {
+		log.Printf("⚠️ Cannot send screen frame: not connected")
+		return
+	}
+
+	go func() {
+		err := c.SendScreenFrame(frame)
+		if err != nil {
+			log.Printf("❌ Error sending screen frame %d: %v", frame.SequenceNum, err)
+		}
+	}()
 }

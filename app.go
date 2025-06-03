@@ -73,6 +73,9 @@ type App struct {
 
 	// FileTransferAgent para transferencia de archivos
 	fileTransferAgent *filetransfer.FileTransferAgent
+
+	// AutoLoginCredentials almacena credenciales para login automático
+	autoLoginCredentials *AutoLoginCredentials
 }
 
 // getDownloadsDirectory detecta el directorio de descargas del usuario
@@ -102,10 +105,19 @@ func getDownloadsDirectory() string {
 	return "./Descargas/RemoteDesk"
 }
 
-// NewApp crea una nueva instancia de App usando MVC
+// NewApp crea una nueva instancia de App usando MVC (versión legacy)
 func NewApp() *App {
+	return NewAppWithConfig("http://localhost:8080", "", "", "")
+}
+
+// NewAppWithConfig crea una nueva instancia de App con configuración personalizada
+func NewAppWithConfig(serverURL, username, password, pcName string) *App {
 	// Inicializar singletons
 	configManager := singleton.GetConfigManager()
+	
+	// Configurar URL del servidor
+	configManager.SetServerURL(serverURL)
+	
 	eventManager := observer.GetInstance()
 
 	// Crear servicios usando Factory Pattern
@@ -125,7 +137,7 @@ func NewApp() *App {
 	downloadDir := getDownloadsDirectory()
 	fmt.Printf("📁 Directorio de transferencias configurado: %s\n", downloadDir)
 
-	return &App{
+	app := &App{
 		appController:      appController,
 		eventManager:       eventManager,
 		configManager:      configManager,
@@ -133,6 +145,24 @@ func NewApp() *App {
 		videoRecorder:      remotecontrol.NewVideoRecorder(remotecontrol.DefaultVideoConfig()),
 		fileTransferAgent:  filetransfer.NewFileTransferAgent(downloadDir),
 	}
+
+	// Configurar credenciales para auto-login si se proporcionaron
+	if username != "" && password != "" {
+		app.autoLoginCredentials = &AutoLoginCredentials{
+			Username: username,
+			Password: password,
+			PCName:   pcName,
+		}
+	}
+
+	return app
+}
+
+// AutoLoginCredentials almacena credenciales para login automático
+type AutoLoginCredentials struct {
+	Username string
+	Password string
+	PCName   string
 }
 
 // startup es llamado cuando la app inicia (Wails)
@@ -389,14 +419,15 @@ func (a *App) shutdown(ctx context.Context) {
 
 // ===== MÉTODOS EXPUESTOS A WAILS (Frontend) =====
 
-// Login maneja el login del usuario - ahora conecta automáticamente al servidor
+// Login maneja el login del usuario - ahora usa URL configurable
 func (a *App) Login(username, password string) map[string]interface{} {
 	runtime.LogInfof(a.ctx, "Starting login process for user: %s", username)
 
-	// 1. Verificar si ya está conectado, si no, conectar al servidor
-	serverURL := "http://localhost:8080" // URL completa con esquema
+	// 1. Obtener URL del servidor desde configuración
+	serverURL := a.configManager.GetServerURL()
+	runtime.LogInfof(a.ctx, "🌐 Conectando a servidor: %s", serverURL)
 
-	// Verificar estado de conexión actual
+	// 1. Verificar si ya está conectado, si no, conectar al servidor
 	connectionStatus := a.appController.GetConnectionStatus()
 	isConnected := false
 	if connectionStatus.ConnectionInfo != nil {
